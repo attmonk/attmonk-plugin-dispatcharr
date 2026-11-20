@@ -54,9 +54,6 @@ func main() {
 	if err != nil {
 		failf("load manifest template: %v", err)
 	}
-	if err := publicmanifest.ValidateCatalogPresentation(manifest, "https://github.com/attmonk/attmonk-plugin-dispatcharr"); err != nil {
-		failf("catalog presentation: %v", err)
-	}
 
 	manifest.PluginId = *pluginID
 	manifest.Version = *version

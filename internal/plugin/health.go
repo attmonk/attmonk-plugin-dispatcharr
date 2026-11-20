@@ -1,27 +1,21 @@
 package plugin
 
-import (
-	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/cache"
-	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/model"
-)
+import "github.com/attmonk/attmonk-plugin-dispatcharr/internal/cache"
 
 type HealthPayload struct {
-	Status             string               `json:"status"`
-	SourceID           string               `json:"sourceId"`
-	SourceName         string               `json:"sourceName"`
-	ChannelCount       int                  `json:"channelCount"`
-	ProgramCount       int                  `json:"programCount"`
-	LastSuccessUnix    int64                `json:"lastSuccessUnix"`
-	LastFailureUnix    int64                `json:"lastFailureUnix"`
-	LastError          string               `json:"lastError,omitempty"`
-	EPGStatus          string               `json:"epgStatus,omitempty"`
-	EPGProgramCount    int                  `json:"epgProgramCount,omitempty"`
-	EPGLastSuccessUnix int64                `json:"epgLastSuccessUnix,omitempty"`
-	EPGLastFailureUnix int64                `json:"epgLastFailureUnix,omitempty"`
-	EPGLastError       string               `json:"epgLastError,omitempty"`
-	EPGWarning         string               `json:"epgWarning,omitempty"`
-	ProfileAccess      *model.ProfileAccess `json:"profileAccess,omitempty"`
-	Refresh            RefreshJob           `json:"refresh"`
+	Status             string `json:"status"`
+	SourceID           string `json:"sourceId"`
+	SourceName         string `json:"sourceName"`
+	ChannelCount       int    `json:"channelCount"`
+	ProgramCount       int    `json:"programCount"`
+	LastSuccessUnix    int64  `json:"lastSuccessUnix"`
+	LastFailureUnix    int64  `json:"lastFailureUnix"`
+	LastError          string `json:"lastError,omitempty"`
+	EPGStatus          string `json:"epgStatus,omitempty"`
+	EPGProgramCount    int    `json:"epgProgramCount,omitempty"`
+	EPGLastSuccessUnix int64  `json:"epgLastSuccessUnix,omitempty"`
+	EPGLastFailureUnix int64  `json:"epgLastFailureUnix,omitempty"`
+	EPGLastError       string `json:"epgLastError,omitempty"`
 }
 
 func BuildHealthPayload(snapshot cache.Snapshot) HealthPayload {
@@ -34,7 +28,7 @@ func BuildHealthPayload(snapshot cache.Snapshot) HealthPayload {
 		SourceID:           snapshot.Catalog.Source.ID,
 		SourceName:         snapshot.Catalog.Source.Name,
 		ChannelCount:       len(snapshot.Catalog.Channels),
-		ProgramCount:       snapshot.ProgramCount(),
+		ProgramCount:       len(snapshot.Catalog.Programs),
 		LastSuccessUnix:    snapshot.Health.LastSuccessUnix,
 		LastFailureUnix:    snapshot.Health.LastFailureUnix,
 		LastError:          snapshot.Health.LastError,
@@ -43,7 +37,5 @@ func BuildHealthPayload(snapshot cache.Snapshot) HealthPayload {
 		EPGLastSuccessUnix: snapshot.Health.EPGLastSuccessUnix,
 		EPGLastFailureUnix: snapshot.Health.EPGLastFailureUnix,
 		EPGLastError:       snapshot.Health.EPGLastError,
-		EPGWarning:         snapshot.Health.EPGWarning,
-		ProfileAccess:      snapshot.Catalog.Source.ProfileAccess,
 	}
 }

@@ -11,7 +11,6 @@ import (
 const (
 	DefaultChannelRefreshHours = 24
 	DefaultEPGRefreshHours     = 24
-	MinimumDispatcharrVersion  = "0.27.1"
 )
 
 type SourceMode string
@@ -29,9 +28,6 @@ type Settings struct {
 	DispatcharrUser   string
 	DispatcharrPass   string
 	DispatcharrAPIKey string
-	ChannelProfile    string
-	ChannelProfiles   []string
-	ChannelGroups     []string
 	XtreamBaseURL     string
 	XtreamUsername    string
 	XtreamPassword    string
@@ -44,21 +40,13 @@ type Settings struct {
 	AdminSettings     json.RawMessage
 }
 
-func (s Settings) EffectiveSourceMode() SourceMode {
-	if s.SourceMode != "" {
-		return s.SourceMode
+func (s Settings) Validate() error {
+	if s.SourceMode == "" && strings.TrimSpace(s.DispatcharrURL) != "" {
+		s.SourceMode = SourceModeDirectLogin
 	}
-	if strings.TrimSpace(s.DispatcharrAPIKey) != "" {
-		return SourceModeAPIKey
+	if s.SourceMode == "" && strings.TrimSpace(s.DispatcharrAPIKey) != "" {
+		s.SourceMode = SourceModeAPIKey
 	}
-	if strings.TrimSpace(s.DispatcharrURL) != "" {
-		return SourceModeDirectLogin
-	}
-	return ""
-}
-
-func (s *Settings) Validate() error {
-	s.SourceMode = s.EffectiveSourceMode()
 
 	switch s.SourceMode {
 	case SourceModeDirectLogin:
@@ -117,14 +105,10 @@ func (s *Settings) Validate() error {
 
 func CatalogCacheKey(settings Settings) string {
 	parts := []string{
-		"catalog-v2",
-		string(settings.EffectiveSourceMode()),
+		string(settings.SourceMode),
 		strings.TrimSpace(settings.DispatcharrURL),
 		strings.TrimSpace(settings.DispatcharrUser),
 		strings.TrimSpace(settings.DispatcharrAPIKey),
-		strings.TrimSpace(settings.ChannelProfile),
-		strings.Join(normalizeStringSelection(settings.ChannelProfiles), ","),
-		strings.Join(normalizeStringSelection(settings.ChannelGroups), ","),
 		strings.TrimSpace(settings.XtreamBaseURL),
 		strings.TrimSpace(settings.XtreamUsername),
 		strings.TrimSpace(settings.M3UURL),
@@ -132,18 +116,4 @@ func CatalogCacheKey(settings Settings) string {
 	}
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\x00")))
 	return hex.EncodeToString(sum[:])
-}
-
-func normalizeStringSelection(values []string) []string {
-	seen := map[string]bool{}
-	normalized := make([]string, 0, len(values))
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value == "" || seen[value] {
-			continue
-		}
-		seen[value] = true
-		normalized = append(normalized, value)
-	}
-	return normalized
 }

@@ -3,12 +3,9 @@ package app
 import (
 	"context"
 	"errors"
-	"fmt"
-	"strings"
 	"testing"
 
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/config"
-	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/upstream/dispatcharr"
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/upstream/xtream"
 )
 
@@ -39,57 +36,6 @@ func TestServiceTestConnectionReturnsValidationError(t *testing.T) {
 	err := service.TestConnection(context.Background(), config.Settings{SourceMode: config.SourceModeXtream})
 	if err == nil {
 		t.Fatal("expected validation error")
-	}
-}
-
-func TestServiceTestConnectionAllowsHTMLVersionWhenAPIIsReachable(t *testing.T) {
-	t.Parallel()
-
-	service := NewService(Dependencies{
-		DispatcharrFactory: func(config.Settings) DispatcharrClient {
-			return &stubDispatcharrClient{
-				versionErr: fmt.Errorf("dispatcharr version check inner: %w", &dispatcharr.UnexpectedHTMLError{
-					Endpoint:    "/api/core/version/",
-					Status:      200,
-					ContentType: "text/html; charset=utf-8",
-					Snippet:     "<!DOCTYPE html>",
-				}),
-			}
-		},
-	})
-
-	err := service.TestConnection(context.Background(), config.Settings{
-		SourceMode:      config.SourceModeDirectLogin,
-		DispatcharrURL:  "https://dispatcharr.example.com",
-		DispatcharrUser: "demo",
-		DispatcharrPass: "secret",
-		ChannelRefreshH: 24,
-		EPGRefreshH:     6,
-	})
-	if err != nil {
-		t.Fatalf("expected HTML version endpoint to be skipped after a working API login, got %v", err)
-	}
-}
-
-func TestServiceTestConnectionRejectsOldDispatcharrDirectVersion(t *testing.T) {
-	t.Parallel()
-
-	service := NewService(Dependencies{
-		DispatcharrFactory: func(config.Settings) DispatcharrClient {
-			return &stubDispatcharrClient{version: dispatcharr.VersionInfo{Version: "0.26.9"}}
-		},
-	})
-
-	err := service.TestConnection(context.Background(), config.Settings{
-		SourceMode:      config.SourceModeDirectLogin,
-		DispatcharrURL:  "https://dispatcharr.example.com",
-		DispatcharrUser: "demo",
-		DispatcharrPass: "secret",
-		ChannelRefreshH: 24,
-		EPGRefreshH:     6,
-	})
-	if err == nil || !strings.Contains(err.Error(), config.MinimumDispatcharrVersion) {
-		t.Fatalf("expected minimum version error, got %v", err)
 	}
 }
 

@@ -3,21 +3,15 @@ package plugin
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"math"
 	"net/http"
-	"regexp"
 	"sort"
-	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/cache"
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/model"
-	"github.com/attmonk/silo-plugins/pkg/epg"
 )
 
 type EventsPayload struct {
@@ -35,119 +29,37 @@ type EventCategory struct {
 }
 
 type BroadcastEvent struct {
-	ID           string                 `json:"id"`
-	CategoryID   string                 `json:"categoryId"`
-	CategoryName string                 `json:"categoryName"`
-	Name         string                 `json:"name"`
-	ShortName    string                 `json:"shortName,omitempty"`
-	Description  string                 `json:"description,omitempty"`
-	ImageURL     string                 `json:"imageUrl,omitempty"`
-	Keyword      string                 `json:"keyword,omitempty"`
-	StartUnix    int64                  `json:"startUnix"`
-	EndUnix      int64                  `json:"endUnix,omitempty"`
-	Live         bool                   `json:"live"`
-	Completed    bool                   `json:"completed"`
-	Channels     []SportsChannelMatch   `json:"channels"`
-	EventSeries  bool                   `json:"eventSeries,omitempty"`
-	Windows      []EventBroadcastWindow `json:"windows,omitempty"`
-}
-
-type EventBroadcastWindow struct {
-	StartUnix int64                `json:"startUnix"`
-	EndUnix   int64                `json:"endUnix,omitempty"`
-	Channels  []SportsChannelMatch `json:"channels"`
+	ID           string               `json:"id"`
+	CategoryID   string               `json:"categoryId"`
+	CategoryName string               `json:"categoryName"`
+	Name         string               `json:"name"`
+	ShortName    string               `json:"shortName,omitempty"`
+	Description  string               `json:"description,omitempty"`
+	Keyword      string               `json:"keyword,omitempty"`
+	StartUnix    int64                `json:"startUnix"`
+	EndUnix      int64                `json:"endUnix,omitempty"`
+	Live         bool                 `json:"live"`
+	Completed    bool                 `json:"completed"`
+	Channels     []SportsChannelMatch `json:"channels"`
 }
 
 type EventKeywordRule struct {
-	CategoryID         string   `json:"categoryId"`
-	CategoryName       string   `json:"categoryName"`
-	Keywords           []string `json:"keywords"`
-	ExcludeKeywords    []string `json:"excludeKeywords,omitempty"`
-	EventSeries        bool     `json:"eventSeries,omitempty"`
-	GroupWindowMinutes int      `json:"groupWindowMinutes,omitempty"`
+	CategoryID   string   `json:"categoryId"`
+	CategoryName string   `json:"categoryName"`
+	Keywords     []string `json:"keywords"`
 }
 
 func (s *HTTPRoutesServer) handleEvents(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
 	if request.GetMethod() != "" && request.GetMethod() != http.MethodGet {
 		return textResponse(http.StatusMethodNotAllowed, "method not allowed"), nil
 	}
-	payload, err := s.eventsPayload(ctx, time.Now())
-	if err != nil {
-		return textResponse(http.StatusServiceUnavailable, "guide cache is temporarily unavailable"), nil
-	}
-	return s.respondJSON(http.StatusOK, payload)
+	return s.respondJSON(http.StatusOK, s.eventsPayload(time.Now()))
 }
 
-// eventsCacheTTLSeconds bounds how stale live/completed flags can be when a
-// cached payload is reused for the same snapshot and keyword rules.
-const (
-	eventsCacheTTLSeconds = 30
-	eventsCacheMaxEntries = 16
-)
-
-type eventsCacheKey struct {
-	version uint64
-	rules   string
-	bucket  int64
-}
-
-// eventsPayloadCache memoizes /api/events per snapshot version, keyword rule
-// set and short time bucket. It is bounded: when full it is reset.
-type eventsPayloadCache struct {
-	mu      sync.Mutex
-	entries map[eventsCacheKey]EventsPayload
-}
-
-func (c *eventsPayloadCache) get(key eventsCacheKey) (EventsPayload, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	payload, ok := c.entries[key]
-	return payload, ok
-}
-
-func (c *eventsPayloadCache) put(key eventsCacheKey, payload EventsPayload) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.entries == nil || len(c.entries) >= eventsCacheMaxEntries {
-		c.entries = make(map[eventsCacheKey]EventsPayload, eventsCacheMaxEntries)
-	}
-	c.entries[key] = payload
-}
-
-func eventRulesCacheKey(rules []EventKeywordRule) string {
-	data, err := json.Marshal(rules)
-	if err != nil {
-		return ""
-	}
-	return string(data)
-}
-
-func (s *HTTPRoutesServer) eventsPayload(ctx context.Context, now time.Time) (EventsPayload, error) {
-	ctx, cancel := context.WithTimeout(ctx, 7*time.Second)
-	defer cancel()
-	for attempt := 0; attempt < 2; attempt++ {
-		snapshot := s.store.Current()
-		rules := s.eventKeywordRules()
-		key := eventsCacheKey{version: snapshot.Version, rules: eventRulesCacheKey(rules), bucket: now.Unix() / eventsCacheTTLSeconds}
-		if payload, ok := s.eventsCache.get(key); ok {
-			return payload, nil
-		}
-		index, err := s.guideIndex.window(ctx, snapshot, nil, guideWindow{Start: math.MinInt64, End: now.AddDate(0, 0, 60).Unix() + 1})
-		if errors.Is(err, epg.ErrChanged) {
-			continue
-		}
-		if err != nil {
-			return EventsPayload{}, err
-		}
-		payload := buildEventsPayload(index, snapshot, now, rules)
-		s.eventsCache.put(key, payload)
-		return payload, nil
-	}
-	return EventsPayload{}, epg.ErrChanged
-}
-
-func buildEventsPayload(index *guideIndex, snapshot cache.Snapshot, now time.Time, rules []EventKeywordRule) EventsPayload {
-	events := detectIndexedGuideBroadcastEvents(index, snapshot, now, rules)
+func (s *HTTPRoutesServer) eventsPayload(now time.Time) EventsPayload {
+	snapshot := s.store.Current()
+	rules := s.eventKeywordRules()
+	events := detectGuideBroadcastEvents(snapshot, now, rules)
 	sort.Slice(events, func(i, j int) bool {
 		if events[i].Live != events[j].Live {
 			return events[i].Live
@@ -197,16 +109,7 @@ func defaultEventKeywordRules() []EventKeywordRule {
 		{CategoryID: "awards", CategoryName: "Awards", Keywords: []string{"Academy Awards", "The Oscars", "Oscars", "Tony Awards", "The Tonys", "Golden Globes", "Grammy Awards", "Grammys", "Emmy Awards", "Emmys", "CMA Awards", "ACM Awards", "Billboard Music Awards", "American Music Awards", "BET Awards", "MTV Video Music Awards", "Critics Choice Awards", "SAG Awards"}},
 		{CategoryID: "civic", CategoryName: "Civic", Keywords: []string{"State of the Union", "Presidential Address", "Joint Session", "Inauguration", "Election Night", "Presidential Debate"}},
 		{CategoryID: "parades", CategoryName: "Parades", Keywords: []string{"Thanksgiving Day Parade", "Macy's Thanksgiving Day Parade", "Rose Parade", "Christmas Parade"}},
-		{CategoryID: "entertainment", CategoryName: "Entertainment", Keywords: []string{}},
-	}
-}
-
-func isSportsEventCategoryID(categoryID string) bool {
-	switch normalizeEventCategoryID(categoryID, "") {
-	case "golf", "motor-racing", "combat-sports", "tennis":
-		return true
-	default:
-		return false
+		{CategoryID: "entertainment", CategoryName: "Entertainment", Keywords: []string{"Live Special", "Special Presentation", "Red Carpet", "Ceremony", "Tribute Concert", "Benefit Concert", "Festival"}},
 	}
 }
 
@@ -227,19 +130,10 @@ func normalizeEventKeywordRules(value any) []EventKeywordRule {
 		categoryID, _ := object["categoryId"].(string)
 		categoryName, _ := object["categoryName"].(string)
 		keywords := normalizeKeywordValues(object["keywords"])
-		excludeKeywords := normalizeKeywordValues(object["excludeKeywords"])
-		eventSeries, _ := object["eventSeries"].(bool)
-		groupWindowMinutes := normalizeEventGroupWindowMinutes(object["groupWindowMinutes"], eventSeries)
 		rule := EventKeywordRule{
-			CategoryID:         normalizeEventCategoryID(categoryID, categoryName),
-			CategoryName:       strings.TrimSpace(categoryName),
-			Keywords:           keywords,
-			ExcludeKeywords:    excludeKeywords,
-			EventSeries:        eventSeries,
-			GroupWindowMinutes: groupWindowMinutes,
-		}
-		if isSportsEventCategoryID(rule.CategoryID) {
-			continue
+			CategoryID:   normalizeEventCategoryID(categoryID, categoryName),
+			CategoryName: strings.TrimSpace(categoryName),
+			Keywords:     keywords,
 		}
 		if rule.CategoryName == "" {
 			rule.CategoryName = eventCategoryName(rule.CategoryID)
@@ -260,38 +154,11 @@ func normalizeTypedEventKeywordRules(values []EventKeywordRule) []EventKeywordRu
 			rule.CategoryName = eventCategoryName(rule.CategoryID)
 		}
 		rule.Keywords = normalizeKeywordStrings(rule.Keywords)
-		rule.ExcludeKeywords = normalizeKeywordStrings(rule.ExcludeKeywords)
-		rule.GroupWindowMinutes = normalizeEventGroupWindowMinutes(rule.GroupWindowMinutes, rule.EventSeries)
 		if rule.CategoryID != "" && len(rule.Keywords) > 0 {
 			normalized = append(normalized, rule)
 		}
 	}
 	return normalized
-}
-
-func normalizeEventGroupWindowMinutes(value any, eventSeries bool) int {
-	minutes := 0
-	switch typed := value.(type) {
-	case int:
-		minutes = typed
-	case int64:
-		minutes = int(typed)
-	case float64:
-		minutes = int(typed)
-	}
-	if !eventSeries {
-		return 0
-	}
-	if minutes == 0 {
-		return 60
-	}
-	if minutes < 15 {
-		return 15
-	}
-	if minutes > 360 {
-		return 360
-	}
-	return minutes
 }
 
 func normalizeKeywordValues(value any) []string {
@@ -371,13 +238,6 @@ func eventCategoryName(categoryID string) string {
 }
 
 func detectGuideBroadcastEvents(snapshot cache.Snapshot, now time.Time, rules []EventKeywordRule) []BroadcastEvent {
-	return detectIndexedGuideBroadcastEvents(buildGuideIndex(snapshot), snapshot, now, rules)
-}
-
-// detectIndexedGuideBroadcastEvents scans the index's start-sorted programs,
-// so no per-request copy/sort is needed, and resolves channels via the
-// index's channel map instead of scanning the lineup per matching program.
-func detectIndexedGuideBroadcastEvents(index *guideIndex, snapshot cache.Snapshot, now time.Time, rules []EventKeywordRule) []BroadcastEvent {
 	nowUnix := now.Unix()
 	maxUnix := now.AddDate(0, 0, 60).Unix()
 	categoryNames := map[string]string{}
@@ -385,26 +245,19 @@ func detectIndexedGuideBroadcastEvents(index *guideIndex, snapshot cache.Snapsho
 		categoryNames[category.ID] = category.Name
 	}
 	byKey := map[string]*BroadcastEvent{}
-	for _, program := range index.all {
-		if program.StartUnix > maxUnix {
-			// index.all is start-sorted; nothing later can qualify.
-			break
-		}
+	for _, program := range snapshot.Catalog.Programs {
 		if program.EndUnix > 0 && program.EndUnix < nowUnix-6*3600 {
+			continue
+		}
+		if program.StartUnix > maxUnix {
 			continue
 		}
 		rule, keyword, ok := matchEventKeyword(program, rules)
 		if !ok {
 			continue
 		}
-		if programLooksArchival(program, now) {
-			continue
-		}
-		channel, ok := index.channel(program.ChannelID)
+		channel, ok := channelByIDFromSnapshot(snapshot, program.ChannelID)
 		if !ok {
-			continue
-		}
-		if !eventChannelPlausible(rule.CategoryID, channel, categoryNames[channel.CategoryID]) {
 			continue
 		}
 		key := broadcastProgramMergeKey(program, rule.CategoryID)
@@ -417,155 +270,53 @@ func detectIndexedGuideBroadcastEvents(index *guideIndex, snapshot cache.Snapsho
 				Name:         program.Title,
 				ShortName:    program.Title,
 				Description:  program.Summary,
-				ImageURL:     program.ImageURL,
 				Keyword:      keyword,
 				StartUnix:    program.StartUnix,
 				EndUnix:      program.EndUnix,
-				EventSeries:  rule.EventSeries,
 			}
+			event.Live = broadcastEventIsLive(*event, now)
+			event.Completed = event.EndUnix > 0 && event.EndUnix < nowUnix
 			byKey[key] = event
 		}
 		if event.Description == "" {
 			event.Description = program.Summary
 		}
-		if event.ImageURL == "" {
-			event.ImageURL = program.ImageURL
+		if program.EndUnix > event.EndUnix {
+			event.EndUnix = program.EndUnix
 		}
-		match := SportsChannelMatch{
+		event.Channels = appendEventChannelMatch(event.Channels, SportsChannelMatch{
 			ID:           channel.ID,
 			Name:         channel.Name,
 			CategoryName: firstNonEmpty(categoryNames[channel.CategoryID], channel.CategoryName),
 			LogoURL:      channel.LogoURL,
 			Reason:       "guide: " + keyword,
 			Score:        100,
-		}
-		event.Channels = appendEventChannelMatch(event.Channels, match)
-		appendEventBroadcastWindow(event, program, match, rule)
+		})
 	}
 	events := make([]BroadcastEvent, 0, len(byKey))
 	for _, event := range byKey {
-		finalizeBroadcastEvent(event, now)
+		sort.Slice(event.Channels, func(i, j int) bool {
+			if event.Channels[i].Score != event.Channels[j].Score {
+				return event.Channels[i].Score > event.Channels[j].Score
+			}
+			return event.Channels[i].Name < event.Channels[j].Name
+		})
 		events = append(events, *event)
 	}
 	return events
 }
 
 func matchEventKeyword(program model.Program, rules []EventKeywordRule) (EventKeywordRule, string, bool) {
-	titleText := normalizeMatchText(program.Title)
-	exclusionText := normalizeMatchText(strings.Join([]string{program.Title, program.Summary}, " "))
+	text := normalizeMatchText(strings.Join([]string{program.Title, program.Summary}, " "))
 	for _, rule := range rules {
 		for _, keyword := range rule.Keywords {
 			normalizedKeyword := normalizeMatchText(keyword)
-			// The hosted weekly news show shares the address's name.
-			// Keep explicit address coverage and other configured rules eligible.
-			if normalizedKeyword == "state of the union" && containsMatchTerm(titleText, "state of the union with") {
-				continue
-			}
-			if normalizedKeyword != "" && strings.Contains(" "+titleText+" ", " "+normalizedKeyword+" ") {
-				if matchEventExclusion(exclusionText, rule.ExcludeKeywords) {
-					break
-				}
+			if normalizedKeyword != "" && strings.Contains(" "+text+" ", " "+normalizedKeyword+" ") {
 				return rule, keyword, true
 			}
 		}
 	}
 	return EventKeywordRule{}, "", false
-}
-
-var archivalYearPattern = regexp.MustCompile(`\b(19|20)\d{2}\b`)
-
-var archivalTerms = []string{"rewind", "encore", "encore presentation", "flashback", "retrospective", "throwback", "from the archive", "from the archives", "revisited"}
-
-// programLooksArchival rejects reruns of past events, which EPG data does not flag.
-func programLooksArchival(program model.Program, now time.Time) bool {
-	for _, match := range archivalYearPattern.FindAllString(program.Title, -1) {
-		year, err := strconv.Atoi(match)
-		if err == nil && year < now.Year()-1 {
-			return true
-		}
-	}
-	text := normalizeMatchText(program.Title + " " + program.Summary)
-	for _, term := range archivalTerms {
-		if strings.Contains(" "+text+" ", " "+term+" ") {
-			return true
-		}
-	}
-	return false
-}
-
-func eventChannelPlausible(categoryID string, channel model.Channel, categoryName string) bool {
-	if isSportsEventCategoryID(categoryID) {
-		return false
-	}
-	text := normalizeMatchText(strings.Join([]string{channel.Name, channel.CategoryName, categoryName}, " "))
-	sportsSignals := []string{"sport", "sports", "espn", "golf", "tennis", "racing", "formula", "motor", "ufc", "fight", "boxing", "mma", "nfl", "mlb", "nba", "nhl", "wnba", "mls", "soccer", "football", "basketball", "baseball", "hockey", "cricket", "rugby"}
-	for _, signal := range sportsSignals {
-		if strings.Contains(" "+text+" ", " "+signal+" ") {
-			return false
-		}
-	}
-	return true
-}
-
-func matchEventExclusion(normalizedText string, exclusions []string) bool {
-	for _, exclusion := range exclusions {
-		normalizedExclusion := normalizeMatchText(exclusion)
-		if normalizedExclusion != "" && strings.Contains(" "+normalizedText+" ", " "+normalizedExclusion+" ") {
-			return true
-		}
-	}
-	return false
-}
-
-func appendEventBroadcastWindow(event *BroadcastEvent, program model.Program, match SportsChannelMatch, rule EventKeywordRule) {
-	windowIndex := 0
-	if rule.EventSeries {
-		windowIndex = -1
-		windowSeconds := int64(normalizeEventGroupWindowMinutes(rule.GroupWindowMinutes, true) * 60)
-		for index := range event.Windows {
-			if program.StartUnix >= event.Windows[index].StartUnix && program.StartUnix-event.Windows[index].StartUnix <= windowSeconds {
-				windowIndex = index
-				break
-			}
-		}
-		if windowIndex < 0 {
-			event.Windows = append(event.Windows, EventBroadcastWindow{StartUnix: program.StartUnix, EndUnix: program.EndUnix, Channels: []SportsChannelMatch{}})
-			windowIndex = len(event.Windows) - 1
-		}
-	} else if len(event.Windows) == 0 {
-		event.Windows = append(event.Windows, EventBroadcastWindow{StartUnix: program.StartUnix, EndUnix: program.EndUnix, Channels: []SportsChannelMatch{}})
-	}
-	window := &event.Windows[windowIndex]
-	if window.StartUnix == 0 || (program.StartUnix > 0 && program.StartUnix < window.StartUnix) {
-		window.StartUnix = program.StartUnix
-	}
-	if program.EndUnix > window.EndUnix {
-		window.EndUnix = program.EndUnix
-	}
-	window.Channels = appendEventChannelMatch(window.Channels, match)
-}
-
-func finalizeBroadcastEvent(event *BroadcastEvent, now time.Time) {
-	sort.Slice(event.Windows, func(i, j int) bool { return event.Windows[i].StartUnix < event.Windows[j].StartUnix })
-	for index := range event.Windows {
-		sortEventChannelMatches(event.Windows[index].Channels)
-	}
-	sortEventChannelMatches(event.Channels)
-	if len(event.Windows) > 0 {
-		event.StartUnix = event.Windows[0].StartUnix
-		event.EndUnix = event.Windows[len(event.Windows)-1].EndUnix
-	}
-	event.Live = broadcastEventIsLive(*event, now)
-	event.Completed = broadcastEventIsCompleted(*event, now)
-}
-
-func sortEventChannelMatches(matches []SportsChannelMatch) {
-	sort.Slice(matches, func(i, j int) bool {
-		if matches[i].Score != matches[j].Score {
-			return matches[i].Score > matches[j].Score
-		}
-		return matches[i].Name < matches[j].Name
-	})
 }
 
 func appendEventChannelMatch(matches []SportsChannelMatch, match SportsChannelMatch) []SportsChannelMatch {
@@ -639,15 +390,6 @@ func eventCategories(events []BroadcastEvent) []EventCategory {
 
 func broadcastEventIsLive(event BroadcastEvent, now time.Time) bool {
 	nowUnix := now.Unix()
-	for _, window := range event.Windows {
-		end := window.EndUnix
-		if end == 0 {
-			end = window.StartUnix + 3*3600
-		}
-		if window.StartUnix > 0 && window.StartUnix <= nowUnix && end >= nowUnix {
-			return true
-		}
-	}
 	if event.StartUnix == 0 {
 		return false
 	}
@@ -656,20 +398,4 @@ func broadcastEventIsLive(event BroadcastEvent, now time.Time) bool {
 		end = event.StartUnix + 3*3600
 	}
 	return event.StartUnix <= nowUnix && end >= nowUnix
-}
-
-func broadcastEventIsCompleted(event BroadcastEvent, now time.Time) bool {
-	if len(event.Windows) == 0 {
-		return event.EndUnix > 0 && event.EndUnix < now.Unix()
-	}
-	for _, window := range event.Windows {
-		end := window.EndUnix
-		if end == 0 {
-			end = window.StartUnix + 3*3600
-		}
-		if end >= now.Unix() {
-			return false
-		}
-	}
-	return true
 }

@@ -1,6 +1,6 @@
 {
   "plugin_id": "silo.attmonk.dispatcharr",
-  "version": "0.14.1",
+  "version": "0.2.154",
   "checksum": "__CHECKSUM__",
   "silo_api_version": "v1",
   "supported_platforms": [
@@ -21,26 +21,14 @@
     {
       "type": "scheduled_task.v1",
       "id": "dispatcharr-sync",
-      "display_name": "Dispatcharr catalog sync",
-      "description": "Syncs Live TV channels, guide, VOD, and series from the configured source."
-    },
-    {
-      "type": "scheduled_task.v1",
-      "id": "dispatcharr-refresh-channels",
-      "display_name": "Dispatcharr channel refresh",
-      "description": "Refreshes the Live TV channel lineup without rebuilding the full catalog."
-    },
-    {
-      "type": "scheduled_task.v1",
-      "id": "dispatcharr-refresh-epg",
-      "display_name": "Dispatcharr guide refresh",
-      "description": "Refreshes guide/EPG data for the current Live TV lineup."
+      "display_name": "Dispatcharr for Silo",
+      "description": "Dispatcharr-backed IPTV app with Live TV, guide, favorites, VOD catalog, and series catalog routes."
     },
     {
       "type": "http_routes.v1",
       "id": "dispatcharr-routes",
-      "display_name": "Live TV app",
-      "description": "Serves the Live TV app, API, and playback routes."
+      "display_name": "Live TV App",
+      "description": "Serves the Dispatcharr IPTV app, API, and playback routes."
     }
   ],
   "http_routes": [
@@ -50,16 +38,7 @@
       "path": "/dispatcharr",
       "access": "authenticated",
       "navigable": true,
-      "navigation_label": "Live TV (Dispatcharr)",
-      "navigation_kind": "user"
-    },
-    {
-      "id": "dispatcharr-sports",
-      "method": "GET",
-      "path": "/dispatcharr/sports",
-      "access": "authenticated",
-      "navigable": true,
-      "navigation_label": "Sports",
+      "navigation_label": "Live TV",
       "navigation_kind": "user"
     },
     {
@@ -68,7 +47,7 @@
       "path": "/dispatcharr/admin",
       "access": "admin",
       "navigable": true,
-      "navigation_label": "Dispatcharr Admin",
+      "navigation_label": "Live TV Admin",
       "navigation_kind": "admin"
     },
     {
@@ -100,55 +79,6 @@
       "navigable": false
     },
     {
-      "id": "dispatcharr-asset-app-js",
-      "method": "GET",
-      "path": "/dispatcharr/assets/app.js",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-asset-guide-js",
-      "method": "GET",
-      "path": "/dispatcharr/assets/guide.js",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-asset-player-js",
-      "method": "GET",
-      "path": "/dispatcharr/assets/player.js",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-asset-lineup-js",
-      "method": "GET",
-      "path": "/dispatcharr/assets/lineup.js",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-asset-sports-replays-js",
-      "method": "GET",
-      "path": "/dispatcharr/assets/sports_replays.js",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-asset-sports-hub-js",
-      "method": "GET",
-      "path": "/dispatcharr/assets/sports_hub.js",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-asset-app-css",
-      "method": "GET",
-      "path": "/dispatcharr/assets/app.css",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
       "id": "dispatcharr-channels",
       "method": "GET",
       "path": "/dispatcharr/channels",
@@ -166,13 +96,6 @@
       "id": "dispatcharr-stream",
       "method": "GET",
       "path": "/dispatcharr/stream",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-stream-asset",
-      "method": "GET",
-      "path": "/dispatcharr/stream/asset",
       "access": "authenticated",
       "navigable": false
     },
@@ -201,14 +124,7 @@
       "id": "dispatcharr-api-refresh",
       "method": "POST",
       "path": "/dispatcharr/api/refresh",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-refresh-channels",
-      "method": "POST",
-      "path": "/dispatcharr/api/refresh-channels",
-      "access": "admin",
+      "access": "authenticated",
       "navigable": false
     },
     {
@@ -226,16 +142,23 @@
       "navigable": false
     },
     {
-      "id": "dispatcharr-api-guide-ping",
-      "method": "POST",
-      "path": "/dispatcharr/api/guide/ping",
+      "id": "dispatcharr-api-categories",
+      "method": "GET",
+      "path": "/dispatcharr/api/categories",
       "access": "authenticated",
       "navigable": false
     },
     {
-      "id": "dispatcharr-api-categories",
+      "id": "dispatcharr-api-vod",
       "method": "GET",
-      "path": "/dispatcharr/api/categories",
+      "path": "/dispatcharr/api/vod",
+      "access": "authenticated",
+      "navigable": false
+    },
+    {
+      "id": "dispatcharr-api-series",
+      "method": "GET",
+      "path": "/dispatcharr/api/series",
       "access": "authenticated",
       "navigable": false
     },
@@ -247,86 +170,9 @@
       "navigable": false
     },
     {
-      "id": "dispatcharr-api-recordings-capability",
-      "method": "GET",
-      "path": "/dispatcharr/api/recordings/capability",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
       "id": "dispatcharr-api-recordings-schedule",
       "method": "POST",
       "path": "/dispatcharr/api/recordings",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-recordings-stop",
-      "method": "POST",
-      "path": "/dispatcharr/api/recordings/stop",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-recordings-delete",
-      "method": "POST",
-      "path": "/dispatcharr/api/recordings/delete",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-timeshift-start",
-      "method": "POST",
-      "path": "/dispatcharr/api/timeshift/start",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-timeshift-status",
-      "method": "GET",
-      "path": "/dispatcharr/api/timeshift/status",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-timeshift-heartbeat",
-      "method": "POST",
-      "path": "/dispatcharr/api/timeshift/heartbeat",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-timeshift-stop",
-      "method": "POST",
-      "path": "/dispatcharr/api/timeshift/stop",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-timeshift-admin-status",
-      "method": "GET",
-      "path": "/dispatcharr/api/timeshift/admin-status",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-timeshift-clear",
-      "method": "POST",
-      "path": "/dispatcharr/api/timeshift/clear",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-timeshift-manifest",
-      "method": "GET",
-      "path": "/dispatcharr/timeshift/manifest",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-timeshift-segment",
-      "method": "GET",
-      "path": "/dispatcharr/timeshift/segment",
       "access": "authenticated",
       "navigable": false
     },
@@ -338,37 +184,9 @@
       "navigable": false
     },
     {
-      "id": "dispatcharr-api-sports-league-teams",
-      "method": "GET",
-      "path": "/dispatcharr/api/sports/league-teams",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-sports-news",
-      "method": "GET",
-      "path": "/dispatcharr/api/sports/news",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-sports-team",
-      "method": "GET",
-      "path": "/dispatcharr/api/sports/team",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-sports-standings",
-      "method": "GET",
-      "path": "/dispatcharr/api/sports/standings",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-sports-image",
-      "method": "GET",
-      "path": "/dispatcharr/api/sports/image",
+      "id": "dispatcharr-api-sports-favorites",
+      "method": "POST",
+      "path": "/dispatcharr/api/sports/favorites",
       "access": "authenticated",
       "navigable": false
     },
@@ -376,6 +194,20 @@
       "id": "dispatcharr-api-events",
       "method": "GET",
       "path": "/dispatcharr/api/events",
+      "access": "authenticated",
+      "navigable": false
+    },
+    {
+      "id": "dispatcharr-api-preferences",
+      "method": "GET",
+      "path": "/dispatcharr/api/preferences",
+      "access": "authenticated",
+      "navigable": false
+    },
+    {
+      "id": "dispatcharr-api-preferences-update",
+      "method": "POST",
+      "path": "/dispatcharr/api/preferences",
       "access": "authenticated",
       "navigable": false
     },
@@ -390,21 +222,35 @@
       "id": "dispatcharr-api-admin-settings-update",
       "method": "POST",
       "path": "/dispatcharr/api/admin-settings",
-      "access": "admin",
+      "access": "authenticated",
       "navigable": false
     },
     {
-      "id": "dispatcharr-api-admin-connection",
-      "method": "GET",
-      "path": "/dispatcharr/api/admin-connection",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-admin-connection-update",
+      "id": "dispatcharr-api-favorites",
       "method": "POST",
-      "path": "/dispatcharr/api/admin-connection",
-      "access": "admin",
+      "path": "/dispatcharr/api/favorites",
+      "access": "authenticated",
+      "navigable": false
+    },
+    {
+      "id": "dispatcharr-api-hidden-categories",
+      "method": "POST",
+      "path": "/dispatcharr/api/hidden-categories",
+      "access": "authenticated",
+      "navigable": false
+    },
+    {
+      "id": "dispatcharr-api-playback",
+      "method": "GET",
+      "path": "/dispatcharr/api/playback",
+      "access": "authenticated",
+      "navigable": false
+    },
+    {
+      "id": "dispatcharr-api-playback-update",
+      "method": "POST",
+      "path": "/dispatcharr/api/playback",
+      "access": "authenticated",
       "navigable": false
     },
     {
@@ -427,152 +273,12 @@
       "path": "/dispatcharr/api/watch/stop",
       "access": "authenticated",
       "navigable": false
-    },
-    {
-      "id": "livetv-v1-info",
-      "method": "GET",
-      "path": "/silo-compat/livetv/v1/info",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "livetv-v1-channels",
-      "method": "GET",
-      "path": "/silo-compat/livetv/v1/channels",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "livetv-v1-programs",
-      "method": "GET",
-      "path": "/silo-compat/livetv/v1/programs",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "livetv-v1-stream",
-      "method": "GET",
-      "path": "/silo-compat/livetv/v1/stream",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-transcode-start",
-      "method": "POST",
-      "path": "/dispatcharr/api/transcode/start",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-transcode-status",
-      "method": "GET",
-      "path": "/dispatcharr/api/transcode/status",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-api-transcode-stop",
-      "method": "POST",
-      "path": "/dispatcharr/api/transcode/stop",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "dispatcharr-transcode-media",
-      "method": "GET",
-      "path": "/dispatcharr/transcode/media",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-api-media-start",
-      "path": "/dispatcharr/api/media/start",
-      "method": "POST",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-api-media-status",
-      "path": "/dispatcharr/api/media/status",
-      "method": "GET",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-api-media-stop",
-      "path": "/dispatcharr/api/media/stop",
-      "method": "POST",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-relay-media",
-      "path": "/dispatcharr/relay/media",
-      "method": "GET",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-converted-media",
-      "path": "/dispatcharr/converted/media",
-      "method": "GET",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-rewind-manifest",
-      "path": "/dispatcharr/rewind/manifest",
-      "method": "GET",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-rewind-segment",
-      "path": "/dispatcharr/rewind/segment",
-      "method": "GET",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-media-assets-media-js",
-      "path": "/dispatcharr/assets/media.js",
-      "method": "GET",
-      "access": "authenticated",
-      "navigable": false
-    },
-    {
-      "id": "shared-api-media-admin-status",
-      "path": "/dispatcharr/api/media/admin-status",
-      "method": "GET",
-      "access": "admin",
-      "navigable": false
-    },
-    {
-      "id": "shared-api-media-clear",
-      "path": "/dispatcharr/api/media/clear",
-      "method": "POST",
-      "access": "admin",
-      "navigable": false
     }
   ],
   "metadata": {
-    "configuration_check": true,
     "display_name": "Dispatcharr for Silo",
-    "summary": "Live TV, guide, sports, and DVR plugin for Silo, backed by Dispatcharr.",
+    "summary": "Silo-hosted Dispatcharr IPTV app with Live TV, guide, VOD, and series routes.",
     "jellyfin_api_integration": false
-  },
-  "presentation": {
-    "display_name": "Dispatcharr for Silo",
-    "summary": "Live TV, guide, sports, and DVR plugin for Silo, backed by Dispatcharr.",
-    "description_markdown": "Dispatcharr plugin for Silo. It presents Live TV, the TV guide, sports, events, VOD, series, and Dispatcharr DVR inside Silo. Playback and recordings stay on the configured Dispatcharr, Xtream Codes, or M3U/XMLTV source.",
-    "setup_markdown": "1. Install the plugin in Silo Server.\n2. Open Dispatcharr Admin and choose Dispatcharr Direct, Xtream Codes, or M3U/XMLTV.\n3. For Dispatcharr Direct, use an Admin API key from System > Users > Edit User > API & XC.\n4. Enable the catalog sync scheduled task after install.",
-    "homepage_url": "https://github.com/attmonk/attmonk-plugin-dispatcharr",
-    "source_url": "https://github.com/attmonk/attmonk-plugin-dispatcharr",
-    "support_url": "https://github.com/attmonk/attmonk-plugin-dispatcharr/issues",
-    "changelog_url": "https://github.com/attmonk/attmonk-plugin-dispatcharr/releases",
-    "publisher_name": "ATTMonk",
-    "publisher_url": "https://github.com/attmonk",
-    "license_spdx": "AGPL-3.0-only"
   },
   "category": "Video/Live TV"
 }

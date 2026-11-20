@@ -47,44 +47,14 @@ type ChannelGroup struct {
 	Name String `json:"name"`
 }
 
-type ChannelProfile struct {
-	ID       String   `json:"id"`
-	Name     String   `json:"name"`
-	Channels []String `json:"channels"`
-}
-
-type CurrentUser struct {
-	ID        String `json:"id"`
-	Username  String `json:"username"`
-	UserLevel int    `json:"user_level"`
-}
-
-type VersionInfo struct {
-	Version   String `json:"version"`
-	Timestamp String `json:"timestamp"`
-}
-
 type Program struct {
-	ID               String                  `json:"id"`
-	Title            String                  `json:"title"`
-	SubTitle         String                  `json:"sub_title"`
-	Description      String                  `json:"description"`
-	TVGID            String                  `json:"tvg_id"`
-	StartTime        String                  `json:"start_time"`
-	EndTime          String                  `json:"end_time"`
-	Categories       []string                `json:"categories"`
-	CustomProperties ProgramCustomProperties `json:"custom_properties"`
-}
-
-type ProgramCustomProperties struct {
-	Categories []string       `json:"categories"`
-	Icon       String         `json:"icon"`
-	Images     []ProgramImage `json:"images"`
-}
-
-type ProgramImage struct {
-	URL  String `json:"url"`
-	Type String `json:"type"`
+	ID          String `json:"id"`
+	Title       String `json:"title"`
+	SubTitle    String `json:"sub_title"`
+	Description String `json:"description"`
+	TVGID       String `json:"tvg_id"`
+	StartTime   String `json:"start_time"`
+	EndTime     String `json:"end_time"`
 }
 
 type ProgramSearchResult struct {

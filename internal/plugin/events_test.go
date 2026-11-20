@@ -12,48 +12,6 @@ import (
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/model"
 )
 
-func TestStateOfTheUnionDoesNotMatchWeeklyShow(t *testing.T) {
-	t.Parallel()
-	for _, tc := range []struct {
-		title string
-		want  bool
-	}{
-		{"State of the Union With Jake Tapper and Dana Bash ᴺᵉʷ", false},
-		{"State of the Union with Dana Bash", false},
-		{"CNN: State of the Union with Jake Tapper", false},
-		{"State of the Union", true},
-		{"State of the Union Address", true},
-		{"State of the Union Address with Jake Tapper and Dana Bash", true},
-		{"Presidential Address", true},
-	} {
-		_, _, got := matchEventKeyword(model.Program{Title: tc.title}, defaultEventKeywordRules())
-		if got != tc.want {
-			t.Errorf("%q: matched=%v, want %v", tc.title, got, tc.want)
-		}
-	}
-}
-
-func TestProgramLooksArchival(t *testing.T) {
-	t.Parallel()
-	now := time.Date(2026, time.September, 24, 20, 0, 0, 0, time.UTC)
-	for _, tc := range []struct {
-		title   string
-		summary string
-		want    bool
-	}{
-		{"1960 Presidential Debate - Kennedy vs. Nixon", "", true},
-		{"Jack Johnson - Main Square Festival 2014", "", true},
-		{"Presidential Debate", "On Road to the White House Rewind, from the 1960 campaign.", true},
-		{"2026 MTV Video Music Awards", "", false},
-		{"2025 Rose Parade Highlights", "", false},
-		{"Presidential Debate", "Live coverage from Philadelphia.", false},
-	} {
-		if got := programLooksArchival(model.Program{Title: tc.title, Summary: tc.summary}, now); got != tc.want {
-			t.Errorf("%q: archival=%v, want %v", tc.title, got, tc.want)
-		}
-	}
-}
-
 func TestHTTPRoutesServerEventsDetectsGuidePrograms(t *testing.T) {
 	t.Parallel()
 
@@ -67,7 +25,7 @@ func TestHTTPRoutesServerEventsDetectsGuidePrograms(t *testing.T) {
 				{ID: "ch:news", Name: "News Now", CategoryID: "news", CategoryName: "News"},
 			},
 			Programs: []model.Program{
-				{ID: "p:oscars", ChannelID: "ch:abc", Title: "The Oscars", Summary: "Academy Awards ceremony", ImageURL: "https://images.example/oscars.jpg", StartUnix: start, EndUnix: start + 3*3600},
+				{ID: "p:oscars", ChannelID: "ch:abc", Title: "The Oscars", Summary: "Academy Awards ceremony", StartUnix: start, EndUnix: start + 3*3600},
 				{ID: "p:news", ChannelID: "ch:news", Title: "Evening News", StartUnix: start, EndUnix: start + 3600},
 			},
 			Content: model.ContentState{
@@ -87,9 +45,6 @@ func TestHTTPRoutesServerEventsDetectsGuidePrograms(t *testing.T) {
 	event := payload.Events[0]
 	if event.CategoryID != "awards" || event.Keyword == "" {
 		t.Fatalf("expected awards event with matched keyword, got %+v", event)
-	}
-	if event.ImageURL != "https://images.example/oscars.jpg" {
-		t.Fatalf("expected guide artwork on the event, got %+v", event)
 	}
 	assertBroadcastEventMatch(t, event.Channels, "ch:abc")
 	assertNoBroadcastEventMatch(t, event.Channels, "ch:news")
@@ -129,160 +84,6 @@ func TestHTTPRoutesServerEventsUsesAdminKeywordRules(t *testing.T) {
 	assertBroadcastEventMatch(t, event.Channels, "ch:local")
 }
 
-func TestHTTPRoutesServerEventsExcludesSportsPrograms(t *testing.T) {
-	t.Parallel()
-
-	start := time.Now().Add(24 * time.Hour).Unix()
-	store := cache.NewStore()
-	store.Replace(cache.Snapshot{Catalog: model.CatalogState{
-		Channels: []model.Channel{
-			{ID: "ch:golf", Name: "Golf Network", CategoryID: "golf", CategoryName: "Sports | Golf"},
-			{ID: "ch:studio", Name: "Sports Studio", CategoryID: "studio", CategoryName: "Sports"},
-		},
-		Programs: []model.Program{
-			{ID: "p:coverage", ChannelID: "ch:golf", Title: "PGA Tour: Second Round", Summary: "Live tournament coverage", StartUnix: start, EndUnix: start + 4*3600},
-			{ID: "p:studio", ChannelID: "ch:studio", Title: "Golf Central", Summary: "PGA Tour highlights and recap", StartUnix: start, EndUnix: start + 3600},
-		},
-		Content: model.ContentState{LiveCategories: []model.Category{
-			{ID: "golf", Name: "Sports | Golf", Kind: "live"},
-			{ID: "studio", Name: "Sports", Kind: "live"},
-		}},
-	}})
-
-	payload := fetchEventsPayload(t, NewHTTPRoutesServer(store))
-	if len(payload.Events) != 0 {
-		t.Fatalf("expected sports programs to stay out of Events, got %+v", payload.Events)
-	}
-}
-
-func TestHTTPRoutesServerEventsIgnoresBroadEntertainmentKeywords(t *testing.T) {
-	t.Parallel()
-
-	start := time.Now().Add(24 * time.Hour).Unix()
-	store := cache.NewStore()
-	store.Replace(cache.Snapshot{Catalog: model.CatalogState{
-		Channels: []model.Channel{{ID: "ch:variety", Name: "Variety East", CategoryID: "variety", CategoryName: "US | Entertainment"}},
-		Programs: []model.Program{
-			{ID: "p:festival", ChannelID: "ch:variety", Title: "Summer Music Festival", StartUnix: start, EndUnix: start + 3600},
-			{ID: "p:ceremony", ChannelID: "ch:variety", Title: "Local School Ceremony", StartUnix: start + 3600, EndUnix: start + 7200},
-			{ID: "p:special", ChannelID: "ch:variety", Title: "Friday Live Special", StartUnix: start + 7200, EndUnix: start + 10800},
-		},
-		Content: model.ContentState{LiveCategories: []model.Category{{ID: "variety", Name: "US | Entertainment", Kind: "live"}}},
-	}})
-
-	payload := fetchEventsPayload(t, NewHTTPRoutesServer(store))
-	if len(payload.Events) != 0 {
-		t.Fatalf("expected broad entertainment keywords to stay out of Events, got %+v", payload.Events)
-	}
-}
-
-func TestHTTPRoutesServerEventsDoesNotMatchSummaryOnlyKeywords(t *testing.T) {
-	t.Parallel()
-
-	start := time.Now().Add(24 * time.Hour).Unix()
-	store := cache.NewStore()
-	store.Replace(cache.Snapshot{Catalog: model.CatalogState{
-		Channels: []model.Channel{{ID: "ch:news", Name: "Local News", CategoryID: "news", CategoryName: "News"}},
-		Programs: []model.Program{{
-			ID:        "p:news",
-			ChannelID: "ch:news",
-			Title:     "Evening News",
-			Summary:   "A preview of the Grammy Awards and other entertainment headlines.",
-			StartUnix: start,
-			EndUnix:   start + 3600,
-		}},
-		Content: model.ContentState{LiveCategories: []model.Category{{ID: "news", Name: "News", Kind: "live"}}},
-	}})
-
-	payload := fetchEventsPayload(t, NewHTTPRoutesServer(store))
-	if len(payload.Events) != 0 {
-		t.Fatalf("expected summary-only keyword to be ignored, got %+v", payload.Events)
-	}
-}
-
-func TestHTTPRoutesServerEventsRejectsSportsKeywordsOnNonSportsChannels(t *testing.T) {
-	t.Parallel()
-
-	start := time.Now().Add(24 * time.Hour).Unix()
-	store := cache.NewStore()
-	store.Replace(cache.Snapshot{Catalog: model.CatalogState{
-		Channels: []model.Channel{{ID: "ch:music", Name: "MC Dance EDM", CategoryID: "music", CategoryName: "International TV | Music"}},
-		Programs: []model.Program{{
-			ID:        "p:race",
-			ChannelID: "ch:music",
-			Title:     "Formula 1",
-			StartUnix: start,
-			EndUnix:   start + 2*3600,
-		}},
-		Content: model.ContentState{LiveCategories: []model.Category{{ID: "music", Name: "International TV | Music", Kind: "live"}}},
-	}})
-
-	payload := fetchEventsPayload(t, NewHTTPRoutesServer(store))
-	if len(payload.Events) != 0 {
-		t.Fatalf("expected non-sports channel event to be rejected, got %+v", payload.Events)
-	}
-}
-
-func TestHTTPRoutesServerEventsGroupsEventSeriesBroadcastWindows(t *testing.T) {
-	t.Parallel()
-
-	day := time.Now().UTC().AddDate(0, 0, 2)
-	start := time.Date(day.Year(), day.Month(), day.Day(), 12, 0, 0, 0, time.UTC).Unix()
-	store := cache.NewStore()
-	store.Replace(cache.Snapshot{Catalog: model.CatalogState{
-		Channels: []model.Channel{
-			{ID: "ch:one", Name: "Awards One", CategoryID: "entertainment", CategoryName: "Entertainment"},
-			{ID: "ch:two", Name: "Awards Two", CategoryID: "entertainment", CategoryName: "Entertainment"},
-		},
-		Programs: []model.Program{
-			{ID: "p:late", ChannelID: "ch:one", Title: "Grammy Awards", StartUnix: start + 4*3600, EndUnix: start + 6*3600},
-			{ID: "p:early-two", ChannelID: "ch:two", Title: "Grammy Awards", StartUnix: start + 30*60, EndUnix: start + 2*3600},
-			{ID: "p:early-one", ChannelID: "ch:one", Title: "Grammy Awards", StartUnix: start, EndUnix: start + 2*3600},
-		},
-		Content: model.ContentState{LiveCategories: []model.Category{{ID: "entertainment", Name: "Entertainment", Kind: "live"}}},
-	}})
-	store.SetAdminSettings(json.RawMessage(`{"eventKeywords":[{"categoryId":"awards","categoryName":"Awards","keywords":["Grammy Awards"],"eventSeries":true,"groupWindowMinutes":60}]}`))
-
-	payload := fetchEventsPayload(t, NewHTTPRoutesServer(store))
-	if len(payload.Events) != 1 {
-		t.Fatalf("expected one event-series card, got %+v", payload.Events)
-	}
-	event := payload.Events[0]
-	if len(event.Windows) != 2 {
-		t.Fatalf("expected two coverage windows, got %+v", event.Windows)
-	}
-	if event.Windows[0].StartUnix != start || event.Windows[1].StartUnix != start+4*3600 {
-		t.Fatalf("expected deterministic window order, got %+v", event.Windows)
-	}
-	if len(event.Windows[0].Channels) != 2 || len(event.Channels) != 2 {
-		t.Fatalf("expected deduplicated window and flat channels, got windows=%+v channels=%+v", event.Windows, event.Channels)
-	}
-	if event.StartUnix != start || event.EndUnix != start+6*3600 {
-		t.Fatalf("expected legacy bounds to span the coverage windows, got %+v", event)
-	}
-}
-
-func TestHTTPRoutesServerEventsKeepsDifferentSeriesTitlesSeparate(t *testing.T) {
-	t.Parallel()
-
-	start := time.Now().Add(72 * time.Hour).Unix()
-	store := cache.NewStore()
-	store.Replace(cache.Snapshot{Catalog: model.CatalogState{
-		Channels: []model.Channel{{ID: "ch:arts", Name: "Arts Channel", CategoryID: "arts", CategoryName: "Arts"}},
-		Programs: []model.Program{
-			{ID: "p:one", ChannelID: "ch:arts", Title: "Film Festival: Opening Night", StartUnix: start, EndUnix: start + 3*3600},
-			{ID: "p:two", ChannelID: "ch:arts", Title: "Film Festival: Director Showcase", StartUnix: start + 20*60, EndUnix: start + 3*3600},
-		},
-		Content: model.ContentState{LiveCategories: []model.Category{{ID: "arts", Name: "Arts", Kind: "live"}}},
-	}})
-	store.SetAdminSettings(json.RawMessage(`{"eventKeywords":[{"categoryId":"entertainment","categoryName":"Entertainment","keywords":["Film Festival"],"eventSeries":true,"groupWindowMinutes":60}]}`))
-
-	payload := fetchEventsPayload(t, NewHTTPRoutesServer(store))
-	if len(payload.Events) != 2 {
-		t.Fatalf("expected distinct tournament titles to remain separate, got %+v", payload.Events)
-	}
-}
-
 func fetchEventsPayload(t *testing.T, server *HTTPRoutesServer) EventsPayload {
 	t.Helper()
 
@@ -317,70 +118,6 @@ func assertNoBroadcastEventMatch(t *testing.T, matches []SportsChannelMatch, cha
 	for _, match := range matches {
 		if match.ID == channelID {
 			t.Fatalf("did not expect %s in event matches: %+v", channelID, matches)
-		}
-	}
-}
-
-func TestEventsPayloadIsCachedPerSnapshotVersionAndRules(t *testing.T) {
-	t.Parallel()
-
-	start := time.Now().Add(24 * time.Hour).Unix()
-	store := cache.NewStore()
-	store.Replace(cache.Snapshot{Catalog: model.CatalogState{
-		Channels: []model.Channel{{ID: "ch:abc", Name: "ABC East", CategoryName: "US | Locals"}},
-		Programs: []model.Program{{ID: "p:oscars", ChannelID: "ch:abc", Title: "The Oscars", StartUnix: start, EndUnix: start + 3600}},
-	}})
-	server := NewHTTPRoutesServer(store)
-	// Start at a cache bucket's first second so the calls below, a few seconds
-	// apart, share a bucket and differ only by what they mean to invalidate.
-	now := time.Unix(time.Now().Unix()/eventsCacheTTLSeconds*eventsCacheTTLSeconds, 0)
-
-	first, err := server.eventsPayload(context.Background(), now)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(first.Events) != 1 {
-		t.Fatalf("expected one event, got %+v", first.Events)
-	}
-	index := server.guideIndex.get(store.Current())
-	// Mutating the cached result proves the second call reused it.
-	first.Events[0].Name = "cached marker"
-	if again, err := server.eventsPayload(context.Background(), now.Add(time.Second)); err != nil || len(again.Events) != 1 || again.Events[0].Name != "cached marker" {
-		t.Fatalf("expected cached events payload, got %+v", again.Events)
-	}
-	if server.guideIndex.get(store.Current()) != index {
-		t.Fatal("events should reuse the shared guide index")
-	}
-
-	// New rules invalidate without a snapshot change.
-	store.SetAdminSettings(json.RawMessage(`{"eventKeywords":[{"categoryId":"civic","categoryName":"Civic","keywords":["State of the Union"]}]}`))
-	if changed, err := server.eventsPayload(context.Background(), now.Add(2*time.Second)); err != nil || len(changed.Events) != 0 {
-		t.Fatalf("expected rules change to recompute events, got %+v", changed.Events)
-	}
-	store.SetAdminSettings(nil)
-
-	// A new snapshot invalidates as well.
-	store.Replace(cache.Snapshot{Catalog: model.CatalogState{
-		Channels: []model.Channel{{ID: "ch:abc", Name: "ABC East", CategoryName: "US | Locals"}},
-		Programs: []model.Program{{ID: "p:grammys", ChannelID: "ch:abc", Title: "Grammy Awards", StartUnix: start, EndUnix: start + 3600}},
-	}})
-	refreshed, err := server.eventsPayload(context.Background(), now.Add(3*time.Second))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(refreshed.Events) != 1 || refreshed.Events[0].Name != "Grammy Awards" {
-		t.Fatalf("expected recomputed events after snapshot change, got %+v", refreshed.Events)
-	}
-}
-
-func TestEventsCacheIsBounded(t *testing.T) {
-	t.Parallel()
-
-	var cacheUnderTest eventsPayloadCache
-	for i := 0; i < eventsCacheMaxEntries*3; i++ {
-		cacheUnderTest.put(eventsCacheKey{version: uint64(i)}, EventsPayload{})
-		if len(cacheUnderTest.entries) > eventsCacheMaxEntries {
-			t.Fatalf("cache grew beyond bound: %d", len(cacheUnderTest.entries))
 		}
 	}
 }
