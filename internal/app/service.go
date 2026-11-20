@@ -1,20 +1,18 @@
 package app
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/cache"
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/config"
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/model"
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/upstream/dispatcharr"
-	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/upstream/xmltv"
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/upstream/xtream"
-	sharedhttp "github.com/attmonk/silo-plugins/pkg/livemedia/httpclient"
 )
 
 type XtreamClient interface {
@@ -26,11 +24,8 @@ type XtreamClient interface {
 
 type DispatcharrClient interface {
 	TestConnection(ctx context.Context) error
-	Version(ctx context.Context) (dispatcharr.VersionInfo, error)
 	Channels(ctx context.Context) ([]dispatcharr.Channel, error)
 	ChannelGroups(ctx context.Context) ([]dispatcharr.ChannelGroup, error)
-	ChannelProfiles(ctx context.Context) ([]dispatcharr.ChannelProfile, error)
-	CurrentUser(ctx context.Context) (dispatcharr.CurrentUser, error)
 	Programs(ctx context.Context) ([]dispatcharr.Program, error)
 	SearchPrograms(ctx context.Context, start, end time.Time) ([]dispatcharr.ProgramSearchResult, error)
 	VODCategories(ctx context.Context) ([]dispatcharr.VODCategory, error)
@@ -45,14 +40,9 @@ type DispatcharrClient interface {
 
 type Dependencies struct {
 	Store              *cache.Store
-	SnapshotStorage    cache.SnapshotStorage
 	XtreamFactory      func(baseURL, username, password string) XtreamClient
 	DispatcharrFactory func(settings config.Settings) DispatcharrClient
 	FetchURL           func(ctx context.Context, rawURL string) ([]byte, error)
-	// OpenURL streams a response body. XMLTV guides use it so large feeds are
-	// decoded incrementally instead of being buffered in full. When nil and
-	// FetchURL is set, OpenURL wraps FetchURL's bytes.
-	OpenURL func(ctx context.Context, rawURL string) (io.ReadCloser, error)
 }
 
 type Service struct {
@@ -60,7 +50,8 @@ type Service struct {
 	xtreamFactory      func(baseURL, username, password string) XtreamClient
 	dispatcharrFactory func(settings config.Settings) DispatcharrClient
 	fetchURL           func(ctx context.Context, rawURL string) ([]byte, error)
-	openURL            func(ctx context.Context, rawURL string) (io.ReadCloser, error)
+	epgMu              sync.Mutex
+	epgRunning         bool
 }
 
 const SourceModeResetWarning = "Changing source mode resets cached channel and guide data before rebuilding Live TV."
@@ -80,107 +71,35 @@ func NewService(deps Dependencies) *Service {
 	dispatcharrFactory := deps.DispatcharrFactory
 	if dispatcharrFactory == nil {
 		dispatcharrFactory = func(settings config.Settings) DispatcharrClient {
-			if settings.EffectiveSourceMode() == config.SourceModeAPIKey {
+			if settings.SourceMode == config.SourceModeAPIKey {
 				return dispatcharr.NewAPIKeyClient(settings.DispatcharrURL, settings.DispatcharrAPIKey)
 			}
 			return dispatcharr.NewLoginClient(settings.DispatcharrURL, settings.DispatcharrUser, settings.DispatcharrPass)
 		}
 	}
 
-	client := &http.Client{Timeout: 5 * time.Minute}
-	defaultOpen := func(ctx context.Context, rawURL string) (io.ReadCloser, error) {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-		if err != nil {
-			return nil, sharedhttp.RedactErrorURL(err)
-		}
-		response, err := client.Do(req)
-		if err != nil {
-			return nil, sharedhttp.RedactErrorURL(err)
-		}
-		if response.StatusCode < 200 || response.StatusCode >= 300 {
-			_ = response.Body.Close()
-			return nil, fmt.Errorf("unexpected status %d", response.StatusCode)
-		}
-		return response.Body, nil
-	}
-
 	fetcher := deps.FetchURL
-	opener := deps.OpenURL
 	if fetcher == nil {
+		client := &http.Client{Timeout: 5 * time.Minute}
 		fetcher = func(ctx context.Context, rawURL string) ([]byte, error) {
-			body, err := defaultOpen(ctx, rawURL)
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 			if err != nil {
 				return nil, err
 			}
-			defer body.Close()
-			return sharedhttp.ReadAllLimit(body, sharedhttp.MaxCatalogResponseBytes)
-		}
-		if opener == nil {
-			opener = defaultOpen
-		}
-	}
-	if opener == nil {
-		injected := fetcher
-		opener = func(ctx context.Context, rawURL string) (io.ReadCloser, error) {
-			data, err := injected(ctx, rawURL)
+			response, err := client.Do(req)
 			if err != nil {
 				return nil, err
 			}
-			return io.NopCloser(bytes.NewReader(data)), nil
+			defer response.Body.Close()
+			if response.StatusCode < 200 || response.StatusCode >= 300 {
+				return nil, fmt.Errorf("unexpected status %d", response.StatusCode)
+			}
+			return io.ReadAll(response.Body)
 		}
 	}
 
-	store.SetStorage(deps.SnapshotStorage)
-	return &Service{store: store, xtreamFactory: factory, dispatcharrFactory: dispatcharrFactory, fetchURL: fetcher, openURL: opener}
+	return &Service{store: store, xtreamFactory: factory, dispatcharrFactory: dispatcharrFactory, fetchURL: fetcher}
 }
-
-// fetchXMLTV streams an XMLTV document from rawURL, decoding it token by token
-// under the shared catalog size cap so the raw body is never held in memory.
-// label prefixes errors ("fetch <label> xmltv" / "parse <label> xmltv").
-func (s *Service) fetchXMLTV(ctx context.Context, rawURL, label string, channelIDs map[string]struct{}) (xmltv.Document, error) {
-	prefix := "xmltv"
-	if label != "" {
-		prefix = label + " xmltv"
-	}
-	body, err := s.openURL(ctx, rawURL)
-	if err != nil {
-		return xmltv.Document{}, fmt.Errorf("fetch %s: %w", prefix, sharedhttp.RedactErrorURL(err))
-	}
-	defer body.Close()
-	doc, err := xmltv.ParseReader(body, xmltv.ParseOptions{MaxBytes: sharedhttp.MaxCatalogResponseBytes, ChannelIDs: channelIDs})
-	if err != nil {
-		return xmltv.Document{}, fmt.Errorf("parse %s: %w", prefix, sharedhttp.RedactErrorURL(err))
-	}
-	return doc, nil
-}
-
-func (s *Service) replaceSnapshot(snapshot cache.Snapshot) error {
-	return s.store.Replace(snapshot)
-}
-
-func (s *Service) replaceSnapshotExact(snapshot cache.Snapshot) error {
-	return s.store.ReplaceExact(snapshot)
-}
-
-func (s *Service) replaceSnapshotAfterSync(snapshot cache.Snapshot, exactGuide bool) error {
-	if exactGuide && len(snapshot.Catalog.Programs) > 0 {
-		return s.replaceSnapshotExact(snapshot)
-	}
-	return s.replaceSnapshot(snapshot)
-}
-
-func (s *Service) replacePrograms(programs []model.Program, atUnix int64) error {
-	if len(programs) == 0 {
-		err := fmt.Errorf("no guide programs were returned")
-		s.store.RecordEPGFailure(atUnix, err.Error())
-		_ = s.persistSnapshot()
-		return err
-	}
-	_, err := s.store.ReplacePrograms(programs, atUnix)
-	return err
-}
-
-func (s *Service) persistSnapshot() error { return s.store.Persist() }
 
 func (s *Service) SwitchSourceMode(ctx context.Context, previous, next config.Settings, nowUnix int64) (string, error) {
 	warning := ""

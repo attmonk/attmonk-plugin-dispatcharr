@@ -2,13 +2,9 @@ package plugin
 
 import (
 	"context"
-	"crypto/sha256"
 	"embed"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"html"
-	"log"
 	"net/http"
 	"net/url"
 	"sort"
@@ -23,177 +19,43 @@ import (
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/model"
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/upstream/dispatcharr"
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/upstream/xtream"
-	sharedclients "github.com/attmonk/silo-plugins/pkg/livemedia/httpclient"
-	sharedhttp "github.com/attmonk/silo-plugins/pkg/livemedia/httpclient"
-	timeshift "github.com/attmonk/silo-plugins/pkg/livemedia/rewind"
-	"github.com/attmonk/silo-plugins/pkg/livemedia/transcode"
-	mediaweb "github.com/attmonk/silo-plugins/pkg/livemedia/web"
 )
 
 //go:embed assets/hls.min.js assets/mpegts.min.js
 var playerAssets embed.FS
 
-var (
-	assetVersionOnce  sync.Once
-	assetVersionValue string
-)
-
 type HTTPRoutesServer struct {
-	mediaBackoff  mediaweb.SourceBackoff
-	streamClients sharedclients.Pool
-	mediaOnce     sync.Once
-	media         *mediaweb.Controller
 	pluginv1.UnimplementedHttpRoutesServer
-	store               *cache.Store
-	settingsProvider    func() config.Settings
-	adminPersister      func(context.Context, map[string]any) error
-	adminStorage        adminSettingsStorage
-	connectionStorage   connectionSettingsStorage
-	connectionTester    func(context.Context, config.ConnectionSettings) error
-	coordinator         *RefreshCoordinator
-	hydrateMu           sync.Mutex
-	hydrateBackgroundMu sync.Mutex
-	hydrateBackground   bool
-	refreshMu           sync.Mutex
-	guideWarmLastUnix   int64
-	profileWarmLastUnix int64
-	sportsProvider      sportsProvider
-	sportsCache         sportsEventCache
-	sportsMu            sync.Mutex
-	sportsStats         footballStatsCache
-	sportsNews          sportsNewsCache
-	sportsGuide         sportsGuideCache
-	sportsPrepared      sportsPreparedCache
-	sportsPreparedMu    sync.Mutex
-	sportsImages        *sportsImageCache
-	timeShift           *timeshift.ViewerManager
-	transcodeMu         sync.Mutex
-	transcoder          *transcode.Manager
-	streamTickets       map[string]streamTicket
-	streamTicketsMu     sync.Mutex
-	guideIndex          guideIndexCache
-	eventsCache         eventsPayloadCache
-}
-
-type connectionSettingsStorage interface {
-	Load() (config.ConnectionSettings, bool, error)
-	Save(config.ConnectionSettings) error
+	store            *cache.Store
+	settingsProvider func() config.Settings
+	syncer           catalogSyncer
+	hydrateMu        sync.Mutex
 }
 
 type catalogSyncer interface {
 	SyncNow(ctx context.Context, settings config.Settings, nowUnix int64) error
 }
 
-type forceCatalogSyncer interface {
-	ForceSyncNow(ctx context.Context, settings config.Settings, nowUnix int64) error
-}
-
-type guideOnlySyncer interface {
-	RefreshGuideOnlyNow(ctx context.Context, settings config.Settings, nowUnix int64) error
-}
-
 func NewHTTPRoutesServer(store *cache.Store) *HTTPRoutesServer {
-	return newHTTPRoutesServer(store, nil, nil)
+	return &HTTPRoutesServer{store: store}
 }
 
 func NewHTTPRoutesServerWithSettings(store *cache.Store, settingsProvider func() config.Settings) *HTTPRoutesServer {
-	return newHTTPRoutesServer(store, settingsProvider, nil)
+	return &HTTPRoutesServer{store: store, settingsProvider: settingsProvider}
 }
 
 func NewHTTPRoutesServerWithSyncer(store *cache.Store, settingsProvider func() config.Settings, syncer catalogSyncer) *HTTPRoutesServer {
-	return newHTTPRoutesServer(store, settingsProvider, syncer)
-}
-
-func NewHTTPRoutesServerWithSyncerAndAdminSettingsFile(store *cache.Store, settingsProvider func() config.Settings, syncer catalogSyncer, path string) *HTTPRoutesServer {
-	server := newHTTPRoutesServer(store, settingsProvider, syncer)
-	server.adminStorage = NewFileAdminSettingsStorage(path)
-	return server
-}
-
-func NewHTTPRoutesServerWithCoordinatorAndAdminSettingsFile(store *cache.Store, settingsProvider func() config.Settings, coordinator *RefreshCoordinator, path string) *HTTPRoutesServer {
-	return NewHTTPRoutesServerWithCoordinatorAndSettingsFiles(store, settingsProvider, coordinator, path, config.NewConnectionStore(""))
-}
-
-func NewHTTPRoutesServerWithCoordinatorAndSettingsFiles(store *cache.Store, settingsProvider func() config.Settings, coordinator *RefreshCoordinator, adminPath string, connectionStore *config.ConnectionStore) *HTTPRoutesServer {
-	server := newHTTPRoutesServer(store, settingsProvider, nil)
-	server.coordinator = coordinator
-	server.adminStorage = NewFileAdminSettingsStorage(adminPath)
-	server.connectionStorage = connectionStore
-	return server
-}
-
-func newHTTPRoutesServer(store *cache.Store, settingsProvider func() config.Settings, syncer catalogSyncer) *HTTPRoutesServer {
-	server := &HTTPRoutesServer{store: store, settingsProvider: settingsProvider, connectionTester: CheckConnection, sportsProvider: newSportarrSportsProvider(&http.Client{Timeout: 8 * time.Second}), sportsImages: newSportsImageCache(defaultSportsImageCacheDir, secureSportsImageHTTPClient()), timeShift: timeshift.NewViewerManager(""), streamTickets: map[string]streamTicket{}}
-	if syncer != nil {
-		server.coordinator = NewRefreshCoordinator(syncer)
-	}
-	return server
+	return &HTTPRoutesServer{store: store, settingsProvider: settingsProvider, syncer: syncer}
 }
 
 type ChannelsPayload struct {
-	SourceName string                 `json:"sourceName"`
-	Channels   []PublicChannel        `json:"channels"`
-	Categories []model.Category       `json:"categories"`
-	Profiles   []model.ChannelProfile `json:"profiles,omitempty"`
-}
-
-type PublicChannel struct {
-	ID               string   `json:"id"`
-	SourceID         string   `json:"sourceId"`
-	Name             string   `json:"name"`
-	Number           string   `json:"number,omitempty"`
-	GuideID          string   `json:"guideId,omitempty"`
-	LogoURL          string   `json:"logoUrl,omitempty"`
-	CategoryID       string   `json:"categoryId,omitempty"`
-	CategoryName     string   `json:"categoryName,omitempty"`
-	ProfileIDs       []string `json:"profileIds,omitempty"`
-	StreamFormat     string   `json:"streamFormat,omitempty"`
-	HLSBufferSeconds int      `json:"hlsBufferSeconds,omitempty"`
-}
-
-type PublicVODItem struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	CategoryID  string `json:"categoryId,omitempty"`
-	PosterURL   string `json:"posterUrl,omitempty"`
-	Rating      string `json:"rating,omitempty"`
-	Added       string `json:"added,omitempty"`
-	Container   string `json:"container,omitempty"`
-	Description string `json:"description,omitempty"`
+	SourceName string           `json:"sourceName"`
+	Channels   []model.Channel  `json:"channels"`
+	Categories []model.Category `json:"categories"`
 }
 
 type GuidePayload struct {
 	Programs []model.Program `json:"programs"`
-}
-
-type guidePingRequest struct {
-	ChannelIDs []string `json:"channelIds"`
-}
-
-type adminConnectionPayload struct {
-	Action           string            `json:"action,omitempty"`
-	SourceMode       config.SourceMode `json:"sourceMode"`
-	BaseURL          string            `json:"baseUrl,omitempty"`
-	Username         string            `json:"username,omitempty"`
-	Password         string            `json:"password,omitempty"`
-	APIKey           string            `json:"apiKey,omitempty"`
-	ChannelProfile   string            `json:"channelProfile,omitempty"`
-	ChannelProfiles  []string          `json:"channelProfiles,omitempty"`
-	ChannelGroups    []string          `json:"channelGroups,omitempty"`
-	M3UURL           string            `json:"m3uUrl,omitempty"`
-	EPGXMLURL        string            `json:"epgXmlUrl,omitempty"`
-	SecretConfigured bool              `json:"secretConfigured"`
-	M3UConfigured    bool              `json:"m3uConfigured"`
-	EPGXMLConfigured bool              `json:"epgXmlConfigured"`
-	Configured       bool              `json:"configured"`
-	Origin           string            `json:"origin,omitempty"`
-}
-
-type GuidePingPayload struct {
-	Status          string `json:"status"`
-	CheckedChannels int    `json:"checkedChannels"`
-	CurrentPrograms int    `json:"currentPrograms"`
-	Refreshing      bool   `json:"refreshing"`
 }
 
 type ContentPayload struct {
@@ -209,14 +71,6 @@ type RecordingsPayload struct {
 	Items     []json.RawMessage `json:"items"`
 }
 
-type RecordingCapabilityPayload struct {
-	Available   bool   `json:"available"`
-	CanSchedule bool   `json:"canSchedule"`
-	CanStop     bool   `json:"canStop"`
-	CanDelete   bool   `json:"canDelete"`
-	Reason      string `json:"reason,omitempty"`
-}
-
 type scheduleRecordingRequest struct {
 	ChannelID   string `json:"channelId"`
 	ProgramID   string `json:"programId"`
@@ -224,10 +78,6 @@ type scheduleRecordingRequest struct {
 	Description string `json:"description"`
 	StartUnix   int64  `json:"startUnix"`
 	EndUnix     int64  `json:"endUnix"`
-}
-
-type recordingActionRequest struct {
-	ID string `json:"id"`
 }
 
 type AppCapabilities struct {
@@ -244,15 +94,22 @@ type AppCapabilities struct {
 }
 
 type AppPayload struct {
-	Status       HealthPayload    `json:"status"`
-	Source       model.Source     `json:"source"`
-	Channels     []PublicChannel  `json:"channels"`
-	Categories   []model.Category `json:"categories"`
-	Capabilities AppCapabilities  `json:"capabilities"`
-	// IsAdmin mirrors the host-stamped X-Silo-User-Role header so the UI can
-	// hide admin-only controls (force refresh, stop/delete recording). The
-	// server enforces those routes independently.
-	IsAdmin bool `json:"isAdmin"`
+	Status       HealthPayload        `json:"status"`
+	Source       model.Source         `json:"source"`
+	Channels     []model.Channel      `json:"channels"`
+	Programs     []model.Program      `json:"programs"`
+	Categories   []model.Category     `json:"categories"`
+	VOD          ContentPayload       `json:"vod"`
+	Series       ContentPayload       `json:"series"`
+	Preferences  cache.Preferences    `json:"preferences"`
+	Sessions     []cache.WatchSession `json:"sessions"`
+	Capabilities AppCapabilities      `json:"capabilities"`
+}
+
+type toggleRequest struct {
+	ID      string `json:"id"`
+	Enabled bool   `json:"enabled"`
+	Hidden  bool   `json:"hidden"`
 }
 
 type watchRequest struct {
@@ -264,127 +121,45 @@ type watchRequest struct {
 }
 
 func (s *HTTPRoutesServer) Handle(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
-	if mediaweb.Handles("/dispatcharr", request.GetPath()) {
-		return s.mediaController().Handle(ctx, request), nil
-	}
-	if strings.HasPrefix(request.GetPath(), "/dispatcharr/timeshift/") {
-		return s.handleTimeShiftMedia(request), nil
-	}
-	if path, _, _ := strings.Cut(request.GetPath(), "?"); strings.HasPrefix(path, "/dispatcharr/api/sports/image/") || path == "/dispatcharr/api/sports/image" {
-		return s.handleSportsImage(ctx, request), nil
-	}
-	// Data routes must leave time for the host to serialize the response before
-	// its ten-second plugin RPC deadline. Provider cache fills may continue in
-	// the background after this individual request stops waiting.
-	if strings.HasPrefix(request.GetPath(), "/dispatcharr/api/sports") {
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 7*time.Second)
-		defer cancel()
-	}
-	if strings.HasPrefix(request.GetPath(), "/dispatcharr/api/transcode/") || request.GetPath() == "/dispatcharr/transcode/media" {
-		return s.handleTranscode(request), nil
-	}
 	switch request.GetPath() {
-	case "/dispatcharr", "/dispatcharr/player", "/dispatcharr/admin", "/dispatcharr/sports":
-		return htmlResponse(http.StatusOK, s.playerPageHTML(request)), nil
+	case "/dispatcharr", "/dispatcharr/player":
+		return htmlResponse(http.StatusOK, playerPageHTML()), nil
 	case "/dispatcharr/assets/hls.min.js", "/assets/hls.min.js":
-		return playerLibraryAssetResponse("assets/hls.min.js")
+		return assetResponse("assets/hls.min.js")
 	case "/dispatcharr/assets/mpegts.min.js", "/assets/mpegts.min.js":
-		return playerLibraryAssetResponse("assets/mpegts.min.js")
-	case "/dispatcharr/assets/app.js", "/assets/app.js":
-		return playerUIAssetResponse("ui/app.js", "application/javascript; charset=utf-8")
-	case "/dispatcharr/assets/guide.js", "/assets/guide.js":
-		return playerUIAssetResponse("ui/guide.js", "application/javascript; charset=utf-8")
-	case "/dispatcharr/assets/player.js", "/assets/player.js":
-		return playerUIAssetResponse("ui/player.js", "application/javascript; charset=utf-8")
-	case "/dispatcharr/assets/lineup.js", "/assets/lineup.js":
-		return playerUIAssetResponse("ui/lineup.js", "application/javascript; charset=utf-8")
-	case "/dispatcharr/assets/sports_replays.js", "/assets/sports_replays.js":
-		return playerUIAssetResponse("ui/sports_replays.js", "application/javascript; charset=utf-8")
-	case "/dispatcharr/assets/sports_hub.js", "/assets/sports_hub.js":
-		return playerUIAssetResponse("ui/sports_hub.js", "application/javascript; charset=utf-8")
-	case "/dispatcharr/assets/app.css", "/assets/app.css":
-		return playerUIAssetResponse("ui/styles.css", "text/css; charset=utf-8")
+		return assetResponse("assets/mpegts.min.js")
 	case "/dispatcharr/status", "/dispatcharr/api/status":
-		return s.respondJSON(http.StatusOK, s.healthPayload())
+		return s.respondJSON(http.StatusOK, BuildHealthPayload(s.store.Current()))
 	case "/dispatcharr/api/refresh":
 		return s.handleRefresh(ctx, request)
-	case "/dispatcharr/api/refresh-channels":
-		return s.handleChannelRefresh(ctx, request)
 	case "/dispatcharr/api/app":
 		s.ensureCatalogHydrated(ctx)
-		return s.respondJSON(http.StatusOK, s.buildAppPayload(request))
+		return s.respondJSON(http.StatusOK, s.buildAppPayload())
 	case "/dispatcharr/channels", "/dispatcharr/api/channels":
 		s.ensureCatalogHydrated(ctx)
 		return s.respondJSON(http.StatusOK, s.channelsPayload())
 	case "/dispatcharr/guide", "/dispatcharr/api/guide":
 		s.ensureCatalogHydrated(ctx)
-		query, err := parseGuideQuery(request)
-		if err != nil {
-			return textResponse(http.StatusBadRequest, err.Error()), nil
-		}
-		index, err := s.windowGuideIndex(ctx, query.ChannelIDs, query.Window)
-		if err != nil {
-			return textResponse(http.StatusServiceUnavailable, "guide cache is temporarily unavailable"), nil
-		}
-		return s.respondJSON(http.StatusOK, GuidePayload{Programs: index.query(query.ChannelIDs, query.Window)})
-	case "/dispatcharr/api/guide/ping":
-		return s.handleGuidePing(ctx, request)
+		channelID := queryValue(request, "channel_id")
+		programs := programsForChannel(s.store.Current().Catalog.Programs, channelID)
+		sort.Slice(programs, func(i, j int) bool {
+			return programs[i].StartUnix < programs[j].StartUnix
+		})
+		return s.respondJSON(http.StatusOK, GuidePayload{Programs: programs})
 	case "/dispatcharr/api/categories":
 		s.ensureCatalogHydrated(ctx)
 		return s.respondJSON(http.StatusOK, s.categoriesPayload())
 	case "/dispatcharr/api/vod":
-		s.ensureCatalogHydrated(ctx)
 		return s.respondJSON(http.StatusOK, s.vodPayload())
 	case "/dispatcharr/api/series":
-		s.ensureCatalogHydrated(ctx)
 		return s.respondJSON(http.StatusOK, s.seriesPayload())
-	case "/dispatcharr/api/recordings/capability":
-		return s.handleRecordingCapability(ctx)
-	case "/dispatcharr/api/recordings/stop":
-		return s.handleStopRecording(ctx, request)
-	case "/dispatcharr/api/recordings/delete":
-		return s.handleDeleteRecording(ctx, request)
 	case "/dispatcharr/api/recordings":
-		s.ensureCatalogHydrated(ctx)
 		if request.GetMethod() == http.MethodPost {
 			return s.handleScheduleRecording(ctx, request)
 		}
 		return s.handleRecordings(ctx)
-	case "/dispatcharr/api/timeshift/start":
-		return s.handleTimeShiftStart(request), nil
-	case "/dispatcharr/api/timeshift/status":
-		return s.handleTimeShiftStatus(request), nil
-	case "/dispatcharr/api/timeshift/heartbeat":
-		return s.handleTimeShiftHeartbeat(request), nil
-	case "/dispatcharr/api/timeshift/stop":
-		return s.handleTimeShiftStop(request), nil
-	case "/dispatcharr/api/timeshift/admin-status":
-		return s.handleTimeShiftAdminStatus(request), nil
-	case "/dispatcharr/api/timeshift/clear":
-		return s.handleTimeShiftClear(request), nil
-	case "/dispatcharr/api/sports":
-		s.ensureCatalogHydratedAsync()
-		return s.handleSports(ctx, request)
-	case "/dispatcharr/api/sports/league-teams":
-		return s.handleSportsLeagueTeams(ctx, request)
-	case "/dispatcharr/api/sports/news":
-		return s.handleSportsNews(ctx, request)
-	case "/dispatcharr/api/sports/team":
-		return s.handleSportsTeam(ctx, request)
-	case "/dispatcharr/api/sports/standings":
-		return s.handleSportsStandings(ctx, request)
-	case "/dispatcharr/api/sports/favorites":
-		return s.handleSportsFavorite(request)
-	case "/dispatcharr/api/events":
-		s.ensureCatalogHydratedAsync()
-		return s.handleEvents(ctx, request)
 	case "/dispatcharr/api/preferences":
 		return s.handlePreferences(request)
-	case "/dispatcharr/api/admin-settings":
-		return s.handleAdminSettings(ctx, request)
-	case "/dispatcharr/api/admin-connection":
-		return s.handleAdminConnection(ctx, request)
 	case "/dispatcharr/api/favorites":
 		return s.handleFavorite(request)
 	case "/dispatcharr/api/hidden-categories":
@@ -407,11 +182,9 @@ func (s *HTTPRoutesServer) Handle(ctx context.Context, request *pluginv1.HandleH
 		if err != nil {
 			return textResponse(http.StatusNotFound, err.Error()), nil
 		}
-		return s.serveProviderStream(ctx, streamURL, request), nil
-	case "/dispatcharr/stream/asset":
-		return s.handleStreamAsset(ctx, request), nil
+		streamURL = appendPlaybackQuery(streamURL, request)
+		return redirectResponse(streamURL), nil
 	case "/dispatcharr/vod/stream":
-		s.ensureCatalogHydrated(ctx)
 		itemID := queryValue(request, "item_id")
 		if strings.TrimSpace(itemID) == "" {
 			return textResponse(http.StatusBadRequest, "missing item_id query parameter"), nil
@@ -420,177 +193,31 @@ func (s *HTTPRoutesServer) Handle(ctx context.Context, request *pluginv1.HandleH
 		if err != nil {
 			return textResponse(http.StatusNotFound, err.Error()), nil
 		}
-		return s.serveProviderStream(ctx, streamURL, request), nil
-	case "/silo-compat/livetv/v1/info":
-		return s.handleLiveTVInfo(ctx), nil
-	case "/silo-compat/livetv/v1/channels":
-		return s.handleLiveTVChannels(ctx), nil
-	case "/silo-compat/livetv/v1/stream":
-		return s.handleLiveTVStream(ctx, request), nil
-	case "/silo-compat/livetv/v1/programs":
-		return s.handleLiveTVPrograms(ctx, request), nil
+		return redirectResponse(streamURL), nil
 	default:
 		return textResponse(http.StatusNotFound, "route not found"), nil
 	}
 }
 
 func (s *HTTPRoutesServer) ensureCatalogHydrated(ctx context.Context) {
-	if s.coordinator == nil || s.settingsProvider == nil {
-		return
-	}
-
-	settings := s.settingsProvider()
-	current := s.store.Current()
-	if len(current.Catalog.Channels) > 0 && catalogSnapshotMatchesSettings(current, settings) {
-		s.startBackgroundProfileWarm(current, settings)
-		s.startMissingGuideWarm(current, settings)
+	if len(s.store.Current().Catalog.Channels) > 0 || s.syncer == nil || s.settingsProvider == nil {
 		return
 	}
 
 	s.hydrateMu.Lock()
 	defer s.hydrateMu.Unlock()
 
-	current = s.store.Current()
-	if len(current.Catalog.Channels) > 0 && catalogSnapshotMatchesSettings(current, settings) {
-		s.startBackgroundProfileWarm(current, settings)
-		s.startMissingGuideWarm(current, settings)
+	if len(s.store.Current().Catalog.Channels) > 0 {
 		return
-	}
-	if len(current.Catalog.Channels) > 0 && !catalogSnapshotMatchesSettings(current, settings) {
-		s.store.Replace(cache.Snapshot{
-			Catalog:   model.CatalogState{Source: model.LiveTVSource(modelSourceModeForSettings(settings))},
-			ConfigKey: config.CatalogCacheKey(settings),
-		})
-	}
-	if err := settings.Validate(); err != nil {
-		s.store.RecordFailure(time.Now().Unix(), err.Error())
-		return
-	}
-	tightDeadline := catalogRequestHasTightDeadline(ctx)
-	if err := s.coordinator.Run(ctx, RefreshCatalog, settings, time.Now().Unix()); err != nil {
-		s.store.RecordFailure(time.Now().Unix(), err.Error())
-		return
-	}
-	sourceMode := settings.EffectiveSourceMode()
-	if s.store.Current().ProgramCount() == 0 || (tightDeadline && (sourceMode == config.SourceModeDirectLogin || sourceMode == config.SourceModeAPIKey)) {
-		_, _ = s.startBackgroundGuideWarm(settings)
-	}
-}
-
-func (s *HTTPRoutesServer) ensureCatalogHydratedAsync() {
-	if s.coordinator == nil || s.settingsProvider == nil {
-		return
-	}
-
-	settings := s.settingsProvider()
-	current := s.store.Current()
-	if len(current.Catalog.Channels) > 0 && catalogSnapshotMatchesSettings(current, settings) {
-		s.startBackgroundProfileWarm(current, settings)
-		s.startMissingGuideWarm(current, settings)
-		return
-	}
-
-	s.hydrateBackgroundMu.Lock()
-	if s.hydrateBackground {
-		s.hydrateBackgroundMu.Unlock()
-		return
-	}
-	s.hydrateBackground = true
-	s.hydrateBackgroundMu.Unlock()
-
-	go func() {
-		defer func() {
-			s.hydrateBackgroundMu.Lock()
-			s.hydrateBackground = false
-			s.hydrateBackgroundMu.Unlock()
-		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
-		defer cancel()
-		s.ensureCatalogHydrated(ctx)
-	}()
-}
-
-// startMissingGuideWarm loads the guide for a catalog that has channels but no
-// programs and no guide load running. A channels-only refresh keeps the
-// programs it finds in the store, so after the saved snapshot is lost it saves
-// channels alone, and nothing else would load the guide before the scheduled
-// guide refresh. startBackgroundGuideWarm limits retries to one per cooldown.
-func (s *HTTPRoutesServer) startMissingGuideWarm(current cache.Snapshot, settings config.Settings) {
-	if current.ProgramCount() > 0 || current.Health.EPGStatus == "loading" {
-		return
-	}
-	_, _ = s.startBackgroundGuideWarm(settings)
-}
-
-func catalogRequestHasTightDeadline(ctx context.Context) bool {
-	deadline, ok := ctx.Deadline()
-	return ok && time.Until(deadline) < 45*time.Second
-}
-
-func catalogSnapshotMatchesSettings(snapshot cache.Snapshot, settings config.Settings) bool {
-	if len(snapshot.Catalog.Channels) == 0 {
-		return false
-	}
-	return snapshot.Catalog.Source.Mode == modelSourceModeForSettings(settings) && snapshot.ConfigKey == config.CatalogCacheKey(settings)
-}
-
-func profileCatalogNeedsRefresh(snapshot cache.Snapshot, settings config.Settings) bool {
-	if modelSourceModeForSettings(settings) != model.SourceModeDirectLogin {
-		return false
-	}
-	access := snapshot.Catalog.Source.ProfileAccess
-	return access == nil || access.Status == "unavailable"
-}
-
-func (s *HTTPRoutesServer) handleChannelRefresh(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
-	if request.GetMethod() != http.MethodPost {
-		return textResponse(http.StatusMethodNotAllowed, "channel refresh requires POST"), nil
-	}
-	if s.coordinator == nil || s.settingsProvider == nil {
-		return textResponse(http.StatusServiceUnavailable, "catalog sync is not available"), nil
 	}
 
 	settings := s.settingsProvider()
 	if err := settings.Validate(); err != nil {
 		s.store.RecordFailure(time.Now().Unix(), err.Error())
-		return textResponse(http.StatusBadRequest, err.Error()), nil
+		return
 	}
-	_, started := s.coordinator.Start(RefreshChannels, settings)
-	status := http.StatusAccepted
-	if !started {
-		status = http.StatusOK
-	}
-	return s.respondJSON(status, s.buildAppPayload(request))
-}
-
-func (s *HTTPRoutesServer) startBackgroundProfileWarm(snapshot cache.Snapshot, settings config.Settings) bool {
-	if s.coordinator == nil || !profileCatalogNeedsRefresh(snapshot, settings) {
-		return false
-	}
-
-	now := time.Now().Unix()
-	s.refreshMu.Lock()
-	if s.profileWarmLastUnix > 0 && now-s.profileWarmLastUnix < 300 {
-		s.refreshMu.Unlock()
-		return false
-	}
-	s.profileWarmLastUnix = now
-	s.refreshMu.Unlock()
-
-	_, started := s.coordinator.Start(RefreshChannels, settings)
-	return started
-}
-
-func modelSourceModeForSettings(settings config.Settings) model.SourceMode {
-	switch settings.EffectiveSourceMode() {
-	case config.SourceModeAPIKey:
-		return model.SourceModeDirectLogin
-	case config.SourceModeXtream:
-		return model.SourceModeXtream
-	case config.SourceModeM3UXMLTV:
-		return model.SourceModeM3UXMLTV
-	default:
-		return model.SourceModeDirectLogin
+	if err := s.syncer.SyncNow(ctx, settings, time.Now().Unix()); err != nil {
+		s.store.RecordFailure(time.Now().Unix(), err.Error())
 	}
 }
 
@@ -598,10 +225,7 @@ func (s *HTTPRoutesServer) handleRefresh(ctx context.Context, request *pluginv1.
 	if request.GetMethod() != http.MethodPost {
 		return textResponse(http.StatusMethodNotAllowed, "refresh requires POST"), nil
 	}
-	if !requestIsAdmin(request) {
-		return adminRequiredResponse("forcing a catalog refresh")
-	}
-	if s.coordinator == nil || s.settingsProvider == nil {
+	if s.syncer == nil || s.settingsProvider == nil {
 		return textResponse(http.StatusServiceUnavailable, "catalog sync is not available"), nil
 	}
 
@@ -613,119 +237,36 @@ func (s *HTTPRoutesServer) handleRefresh(ctx context.Context, request *pluginv1.
 		s.store.RecordFailure(time.Now().Unix(), err.Error())
 		return textResponse(http.StatusBadRequest, err.Error()), nil
 	}
-	started := s.startBackgroundRefresh(settings)
-	status := http.StatusAccepted
-	if !started {
-		status = http.StatusOK
-	}
-	return s.respondJSON(status, s.buildAppPayload(request))
-}
-
-func (s *HTTPRoutesServer) handleGuidePing(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
-	if request.GetMethod() != http.MethodPost {
-		return textResponse(http.StatusMethodNotAllowed, "guide ping requires POST"), nil
-	}
-	if s.coordinator == nil || s.settingsProvider == nil {
-		return textResponse(http.StatusServiceUnavailable, "catalog sync is not available"), nil
-	}
-
-	var payload guidePingRequest
-	if len(request.GetBody()) > 0 {
-		if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
-			return textResponse(http.StatusBadRequest, "invalid guide ping payload"), nil
-		}
-	}
-
-	s.ensureCatalogHydrated(ctx)
-	channelIDs := normalizeChannelIDs(payload.ChannelIDs)
-	nowUnix := time.Now().Unix()
-	currentGuide, err := s.store.Current().ProgramQuery(ctx, channelIDs, nowUnix, nowUnix+1)
-	if err != nil {
-		return textResponse(http.StatusServiceUnavailable, "guide cache is temporarily unavailable"), nil
-	}
-	currentPrograms := currentProgramCountForChannels(currentGuide, channelIDs, nowUnix)
-	if len(channelIDs) == 0 || currentPrograms >= len(channelIDs) {
-		return s.respondJSON(http.StatusOK, GuidePingPayload{Status: "fresh", CheckedChannels: len(channelIDs), CurrentPrograms: currentPrograms})
-	}
-
-	settings := s.settingsProvider()
-	if err := settings.Validate(); err != nil {
+	if err := s.syncer.SyncNow(ctx, settings, time.Now().Unix()); err != nil {
 		s.store.RecordFailure(time.Now().Unix(), err.Error())
-		return textResponse(http.StatusBadRequest, err.Error()), nil
+		return textResponse(http.StatusBadGateway, err.Error()), nil
 	}
-	started, status := s.startBackgroundGuideWarm(settings)
-	responseStatus := http.StatusOK
-	if started {
-		responseStatus = http.StatusAccepted
-	}
-	return s.respondJSON(responseStatus, GuidePingPayload{
-		Status:          status,
-		CheckedChannels: len(channelIDs),
-		CurrentPrograms: currentPrograms,
-		Refreshing:      started,
-	})
+	return s.respondJSON(http.StatusOK, s.buildAppPayload())
 }
 
-func (s *HTTPRoutesServer) startBackgroundRefresh(settings config.Settings) bool {
-	if s.coordinator == nil {
-		return false
-	}
-	s.store.MarkEPGLoading()
-	_, started := s.coordinator.Start(RefreshForce, settings)
-	return started
-}
-
-func (s *HTTPRoutesServer) startBackgroundGuideWarm(settings config.Settings) (bool, string) {
-	if s.coordinator == nil {
-		return false, "unavailable"
-	}
-
-	now := time.Now().Unix()
-	s.refreshMu.Lock()
-	if s.guideWarmLastUnix > 0 && now-s.guideWarmLastUnix < 300 {
-		s.refreshMu.Unlock()
-		return false, "cooldown"
-	}
-	s.guideWarmLastUnix = now
-	s.refreshMu.Unlock()
-
-	s.store.MarkEPGLoading()
-	_, started := s.coordinator.Start(RefreshGuide, settings)
-	if !started {
-		return false, "refreshing"
-	}
-	return true, "refreshing"
-}
-
-func (s *HTTPRoutesServer) buildAppPayload(request *pluginv1.HandleHTTPRequest) AppPayload {
+func (s *HTTPRoutesServer) buildAppPayload() AppPayload {
 	snapshot := s.store.Current()
+	preferences := s.store.Preferences()
 	return AppPayload{
-		IsAdmin:      requestIsAdmin(request),
-		Status:       s.healthPayload(),
+		Status:       BuildHealthPayload(snapshot),
 		Source:       snapshot.Catalog.Source,
-		Channels:     publicChannels(snapshot.Catalog.Channels, s.hlsBufferSeconds()),
+		Channels:     snapshot.Catalog.Channels,
+		Programs:     snapshot.Catalog.Programs,
 		Categories:   liveCategories(snapshot),
-		Capabilities: s.appCapabilities(snapshot.Catalog.Source.Mode),
+		VOD:          s.vodPayload(),
+		Series:       s.seriesPayload(),
+		Preferences:  preferences,
+		Sessions:     s.store.ActiveSessions(),
+		Capabilities: appCapabilities(preferences),
 	}
-}
-
-func (s *HTTPRoutesServer) healthPayload() HealthPayload {
-	payload := BuildHealthPayload(s.store.Current())
-	if s.coordinator != nil {
-		payload.Refresh = s.coordinator.Status()
-	} else {
-		payload.Refresh = RefreshJob{State: RefreshIdle}
-	}
-	return payload
 }
 
 func (s *HTTPRoutesServer) channelsPayload() ChannelsPayload {
 	snapshot := s.store.Current()
 	return ChannelsPayload{
 		SourceName: snapshot.Catalog.Source.Name,
-		Channels:   publicChannels(snapshot.Catalog.Channels, s.hlsBufferSeconds()),
+		Channels:   snapshot.Catalog.Channels,
 		Categories: liveCategories(snapshot),
-		Profiles:   append([]model.ChannelProfile(nil), snapshot.Catalog.Source.Profiles...),
 	}
 }
 
@@ -746,65 +287,8 @@ func (s *HTTPRoutesServer) vodPayload() ContentPayload {
 	return ContentPayload{
 		Available:  len(snapshot.Catalog.Content.VODItems) > 0,
 		Categories: snapshot.Catalog.Content.VODCategories,
-		Items:      publicVODItems(snapshot.Catalog.Content.VODItems),
+		Items:      snapshot.Catalog.Content.VODItems,
 	}
-}
-
-func publicChannels(channels []model.Channel, hlsBufferSeconds int) []PublicChannel {
-	result := make([]PublicChannel, 0, len(channels))
-	for _, channel := range channels {
-		streamFormat := publicStreamFormat(channel.StreamURL)
-		channelHLSBufferSeconds := 0
-		if streamFormat == "hls" {
-			channelHLSBufferSeconds = hlsBufferSeconds
-		}
-		result = append(result, PublicChannel{
-			ID:               channel.ID,
-			SourceID:         channel.SourceID,
-			Name:             channel.Name,
-			Number:           channel.Number,
-			GuideID:          channel.GuideID,
-			LogoURL:          channel.LogoURL,
-			CategoryID:       channel.CategoryID,
-			CategoryName:     channel.CategoryName,
-			ProfileIDs:       append([]string(nil), channel.ProfileIDs...),
-			StreamFormat:     streamFormat,
-			HLSBufferSeconds: channelHLSBufferSeconds,
-		})
-	}
-	return result
-}
-
-func publicStreamFormat(rawURL string) string {
-	parsed, err := url.Parse(strings.TrimSpace(rawURL))
-	if err != nil {
-		return ""
-	}
-	path := strings.ToLower(parsed.Path)
-	if strings.HasSuffix(path, ".m3u8") || strings.Contains(path, "/proxy/hls/") {
-		return "hls"
-	}
-	if strings.HasSuffix(path, ".ts") || strings.Contains(path, "/proxy/ts/") {
-		return "mpegts"
-	}
-	return ""
-}
-
-func publicVODItems(items []model.VODItem) []PublicVODItem {
-	result := make([]PublicVODItem, 0, len(items))
-	for _, item := range items {
-		result = append(result, PublicVODItem{
-			ID:          item.ID,
-			Name:        item.Name,
-			CategoryID:  item.CategoryID,
-			PosterURL:   item.PosterURL,
-			Rating:      item.Rating,
-			Added:       item.Added,
-			Container:   item.Container,
-			Description: item.Description,
-		})
-	}
-	return result
 }
 
 func (s *HTTPRoutesServer) seriesPayload() ContentPayload {
@@ -820,9 +304,6 @@ func (s *HTTPRoutesServer) seriesPayload() ContentPayload {
 }
 
 func (s *HTTPRoutesServer) handleRecordings(ctx context.Context) (*pluginv1.HandleHTTPResponse, error) {
-	if !s.recordingsEnabled() {
-		return s.respondJSON(http.StatusOK, RecordingsPayload{Available: false, Reason: recordingsUnavailableReason(s), Items: []json.RawMessage{}})
-	}
 	client, err := s.dispatcharrClient()
 	if err != nil {
 		return s.respondJSON(http.StatusOK, RecordingsPayload{Available: false, Reason: err.Error(), Items: []json.RawMessage{}})
@@ -834,45 +315,7 @@ func (s *HTTPRoutesServer) handleRecordings(ctx context.Context) (*pluginv1.Hand
 	return s.respondJSON(http.StatusOK, RecordingsPayload{Available: true, Items: enrichRecordings(client, recordings)})
 }
 
-func (s *HTTPRoutesServer) handleRecordingCapability(ctx context.Context) (*pluginv1.HandleHTTPResponse, error) {
-	if !s.recordingsEnabled() {
-		return s.respondJSON(http.StatusOK, RecordingCapabilityPayload{
-			Reason: recordingsUnavailableReason(s),
-		})
-	}
-	if s.settingsProvider == nil {
-		return s.respondJSON(http.StatusOK, RecordingCapabilityPayload{
-			Available: true,
-			Reason:    "Unable to verify Dispatcharr recording permissions.",
-		})
-	}
-	client, err := s.dispatcharrClient()
-	if err != nil {
-		return s.respondJSON(http.StatusOK, RecordingCapabilityPayload{
-			Available: true,
-			Reason:    "Unable to verify Dispatcharr recording permissions.",
-		})
-	}
-	user, err := client.CurrentUser(ctx)
-	if err != nil {
-		return s.respondJSON(http.StatusOK, RecordingCapabilityPayload{
-			Available: true,
-			Reason:    "Unable to verify Dispatcharr recording permissions.",
-		})
-	}
-	if user.UserLevel < 10 {
-		return s.respondJSON(http.StatusOK, RecordingCapabilityPayload{
-			Available: true,
-			Reason:    "Scheduling requires a Dispatcharr admin account or Admin API Key.",
-		})
-	}
-	return s.respondJSON(http.StatusOK, RecordingCapabilityPayload{Available: true, CanSchedule: true, CanStop: true, CanDelete: true})
-}
-
 func (s *HTTPRoutesServer) handleScheduleRecording(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
-	if !s.recordingsEnabled() {
-		return textResponse(http.StatusConflict, recordingsUnavailableReason(s)), nil
-	}
 	var payload scheduleRecordingRequest
 	if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
 		return textResponse(http.StatusBadRequest, "invalid recording payload"), nil
@@ -902,473 +345,79 @@ func (s *HTTPRoutesServer) handleScheduleRecording(ctx context.Context, request 
 	if title == "" {
 		title = channel.Name
 	}
-	startUnix, endUnix := paddedRecordingWindow(payload.StartUnix, payload.EndUnix, s.recordingPrePadMinutes(), s.recordingPostPadMinutes())
-	start := time.Unix(startUnix, 0).UTC()
-	end := time.Unix(endUnix, 0).UTC()
-	custom := map[string]any{
-		"title":        title,
-		"description":  strings.TrimSpace(payload.Description),
-		"channel_name": channel.Name,
-		"source":       "silo.attmonk.dispatcharr",
-		"program_id":   strings.TrimSpace(payload.ProgramID),
-	}
-	if s.recordingComskipEnabled() {
-		custom["comskip"] = true
-	}
+	start := time.Unix(payload.StartUnix, 0).UTC()
+	end := time.Unix(payload.EndUnix, 0).UTC()
 	recording, err := client.CreateRecording(ctx, map[string]any{
-		"channel":           dispatcharrChannelID,
-		"start_time":        start.Format(time.RFC3339),
-		"end_time":          end.Format(time.RFC3339),
-		"custom_properties": custom,
+		"channel":    dispatcharrChannelID,
+		"start_time": start.Format(time.RFC3339),
+		"end_time":   end.Format(time.RFC3339),
+		"custom_properties": map[string]any{
+			"program": map[string]any{
+				"id":          strings.TrimSpace(payload.ProgramID),
+				"title":       title,
+				"description": strings.TrimSpace(payload.Description),
+				"start_time":  start.Format(time.RFC3339),
+				"end_time":    end.Format(time.RFC3339),
+				"tvg_id":      strings.TrimSpace(channel.GuideID),
+			},
+			"channel_name": channel.Name,
+			"source":       "silo.attmonk.dispatcharr",
+		},
 	})
 	if err != nil {
-		return scheduleRecordingErrorResponse(err), nil
-	}
-	return s.respondJSON(http.StatusOK, map[string]any{"ok": true, "recording": enrichRecording(client, recording)})
-}
-
-func (s *HTTPRoutesServer) handleStopRecording(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
-	if !requestIsAdmin(request) {
-		return adminRequiredResponse("stopping a recording")
-	}
-	if !s.recordingsEnabled() {
-		return textResponse(http.StatusConflict, recordingsUnavailableReason(s)), nil
-	}
-	id, err := recordingActionID(request)
-	if err != nil {
-		return textResponse(http.StatusBadRequest, err.Error()), nil
-	}
-	client, err := s.dispatcharrClient()
-	if err != nil {
 		return textResponse(http.StatusBadGateway, err.Error()), nil
 	}
-	recording, err := client.StopRecording(ctx, id)
-	if err != nil {
-		return scheduleRecordingErrorResponse(err), nil
-	}
 	return s.respondJSON(http.StatusOK, map[string]any{"ok": true, "recording": enrichRecording(client, recording)})
-}
-
-func (s *HTTPRoutesServer) handleDeleteRecording(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
-	if !requestIsAdmin(request) {
-		return adminRequiredResponse("deleting a recording")
-	}
-	if !s.recordingsEnabled() {
-		return textResponse(http.StatusConflict, recordingsUnavailableReason(s)), nil
-	}
-	id, err := recordingActionID(request)
-	if err != nil {
-		return textResponse(http.StatusBadRequest, err.Error()), nil
-	}
-	client, err := s.dispatcharrClient()
-	if err != nil {
-		return textResponse(http.StatusBadGateway, err.Error()), nil
-	}
-	if err := client.DeleteRecording(ctx, id); err != nil {
-		return scheduleRecordingErrorResponse(err), nil
-	}
-	return s.respondJSON(http.StatusOK, map[string]any{"ok": true})
-}
-
-func recordingActionID(request *pluginv1.HandleHTTPRequest) (string, error) {
-	var payload recordingActionRequest
-	if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
-		return "", fmt.Errorf("invalid recording payload")
-	}
-	id := strings.TrimSpace(payload.ID)
-	if id == "" {
-		return "", fmt.Errorf("missing recording id")
-	}
-	return id, nil
-}
-
-func paddedRecordingWindow(startUnix, endUnix int64, prePadMinutes, postPadMinutes int) (int64, int64) {
-	if startUnix > 0 {
-		startUnix -= int64(prePadMinutes) * 60
-	}
-	if endUnix > 0 {
-		endUnix += int64(postPadMinutes) * 60
-	}
-	if endUnix <= startUnix {
-		endUnix = startUnix + 60
-	}
-	return startUnix, endUnix
-}
-
-func (s *HTTPRoutesServer) recordingPrePadMinutes() int {
-	return adminIntSetting(s.normalizedAdminSettings()["recordingPrePadMinutes"], 0, 0, 60)
-}
-
-func (s *HTTPRoutesServer) recordingPostPadMinutes() int {
-	return adminIntSetting(s.normalizedAdminSettings()["recordingPostPadMinutes"], 0, 0, 60)
-}
-
-func adminIntSetting(value any, fallback, minimum, maximum int) int {
-	minutes := fallback
-	switch typed := value.(type) {
-	case int:
-		minutes = typed
-	case int64:
-		minutes = int(typed)
-	case float64:
-		minutes = int(typed)
-	}
-	if minutes < minimum {
-		return minimum
-	}
-	if minutes > maximum {
-		return maximum
-	}
-	return minutes
-}
-
-func (s *HTTPRoutesServer) recordingComskipEnabled() bool {
-	return s.adminFlag("recordingComskipEnabled", false)
-}
-
-func scheduleRecordingErrorResponse(err error) *pluginv1.HandleHTTPResponse {
-	message := err.Error()
-	lower := strings.ToLower(message)
-	if strings.Contains(lower, "unexpected status 401") ||
-		strings.Contains(lower, "unexpected status 403") ||
-		strings.Contains(lower, "unauthorized") ||
-		strings.Contains(lower, "permission") {
-		return textResponse(http.StatusForbidden, "Dispatcharr requires an admin account or API key to schedule recordings.")
-	}
-	return textResponse(http.StatusBadGateway, message)
 }
 
 func (s *HTTPRoutesServer) handlePreferences(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
-	return userStateUnavailableResponse(), nil
-}
-
-func (s *HTTPRoutesServer) handleAdminSettings(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
-	if request.GetMethod() == http.MethodPost && !s.adminSettingsAuthorized(request) {
-		return textResponse(http.StatusForbidden, "Silo administrator access is required"), nil
-	}
 	if request.GetMethod() != http.MethodPost {
-		if s.adminStorage != nil {
-			saved, ok, err := s.adminStorage.Load()
-			if err != nil {
-				log.Printf("dispatcharr: load admin settings file failed: %v", err)
-				return textResponse(http.StatusInternalServerError, "could not load admin settings"), nil
-			}
-			if ok {
-				s.store.SetAdminSettings(saved)
-				return s.respondAdminSettings(request, saved)
-			}
-		}
-		if s.store.HasAdminSettings() {
-			return s.respondAdminSettings(request, s.store.AdminSettings())
-		}
-		if s.settingsProvider != nil {
-			if configured := s.settingsProvider().AdminSettings; len(configured) > 0 {
-				return s.respondAdminSettings(request, configured)
-			}
-		}
-		return s.respondAdminSettings(request, s.store.AdminSettings())
+		return s.respondJSON(http.StatusOK, s.store.Preferences())
 	}
-	var payload map[string]any
-	if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
-		return textResponse(http.StatusBadRequest, "invalid admin settings payload"), nil
+	var preferences cache.Preferences
+	if err := json.Unmarshal(request.GetBody(), &preferences); err != nil {
+		return textResponse(http.StatusBadRequest, "invalid preferences payload"), nil
 	}
-	normalized := normalizeAdminSettingsPayload(payload)
-	encoded, err := json.Marshal(normalized)
-	if err != nil {
-		return textResponse(http.StatusBadRequest, "invalid admin settings payload"), nil
-	}
-	if s.adminStorage != nil {
-		if err := s.adminStorage.Save(encoded); err != nil {
-			log.Printf("dispatcharr: save admin settings file failed: %v", err)
-			return textResponse(http.StatusInternalServerError, "could not save admin settings"), nil
-		}
-	}
-	persistCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-	defer cancel()
-	if err := s.persistAdminSettings(persistCtx, normalized); err != nil {
-		log.Printf("dispatcharr: persist admin plugin settings failed: %v", err)
-		return textResponse(http.StatusBadGateway, "could not save plugin settings"), nil
-	}
-	saved := s.store.SetAdminSettings(encoded)
-	s.sportsPreparedMu.Lock()
-	s.sportsPrepared.ExpiresAfter = time.Time{}
-	s.sportsPreparedMu.Unlock()
-	s.timeShiftConfig()
-	return s.respondJSON(http.StatusOK, json.RawMessage(saved))
-}
-
-func (s *HTTPRoutesServer) handleAdminConnection(ctx context.Context, request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
-	if !s.adminSettingsAuthorized(request) {
-		return textResponse(http.StatusForbidden, "Silo administrator access is required"), nil
-	}
-	if request.GetMethod() == http.MethodGet {
-		connection, origin, err := s.currentConnection()
-		if err != nil {
-			log.Printf("dispatcharr: load connection settings failed: %v", err)
-			return textResponse(http.StatusInternalServerError, "could not load connection settings"), nil
-		}
-		return s.respondJSON(http.StatusOK, publicAdminConnection(connection, origin))
-	}
-	if request.GetMethod() != http.MethodPost {
-		return textResponse(http.StatusMethodNotAllowed, "connection manager requires GET or POST"), nil
-	}
-
-	var payload adminConnectionPayload
-	if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
-		return textResponse(http.StatusBadRequest, "invalid connection payload"), nil
-	}
-	current, _, err := s.currentConnection()
-	if err != nil {
-		return textResponse(http.StatusInternalServerError, "could not load connection settings"), nil
-	}
-	candidate := connectionFromAdminPayload(payload, current)
-	candidate, err = config.NormalizeConnection(candidate)
-	if err != nil {
-		return textResponse(http.StatusBadRequest, err.Error()), nil
-	}
-
-	if strings.EqualFold(strings.TrimSpace(payload.Action), "test") {
-		testCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
-		defer cancel()
-		if s.connectionTester == nil {
-			return textResponse(http.StatusServiceUnavailable, "connection testing is unavailable"), nil
-		}
-		if err := s.connectionTester(testCtx, candidate); err != nil {
-			return textResponse(http.StatusBadGateway, "connection test failed: "+err.Error()), nil
-		}
-		response := publicAdminConnection(candidate, "draft")
-		return s.respondJSON(http.StatusOK, map[string]any{"ok": true, "connection": response})
-	}
-
-	if s.connectionStorage == nil {
-		return textResponse(http.StatusServiceUnavailable, "connection storage is unavailable"), nil
-	}
-	if err := s.connectionStorage.Save(candidate); err != nil {
-		log.Printf("dispatcharr: save connection settings failed: %v", err)
-		return textResponse(http.StatusInternalServerError, "could not save connection settings"), nil
-	}
-	if s.coordinator != nil {
-		settings := config.Settings{LiveTVEnabled: true, ChannelRefreshH: config.DefaultChannelRefreshHours, EPGRefreshH: config.DefaultEPGRefreshHours}
-		candidate.Apply(&settings)
-		s.coordinator.Start(RefreshForce, settings)
-	}
-	return s.respondJSON(http.StatusOK, map[string]any{"ok": true, "connection": publicAdminConnection(candidate, "plugin")})
-}
-
-func (s *HTTPRoutesServer) currentConnection() (config.ConnectionSettings, string, error) {
-	if s.connectionStorage != nil {
-		connection, ok, err := s.connectionStorage.Load()
-		if err != nil {
-			return config.ConnectionSettings{}, "", err
-		}
-		if ok {
-			return connection, "plugin", nil
-		}
-	}
-	if s.settingsProvider != nil {
-		return config.ConnectionFromSettings(s.settingsProvider()), "silo", nil
-	}
-	return config.ConnectionSettings{SourceMode: config.SourceModeDirectLogin}, "empty", nil
-}
-
-func publicAdminConnection(connection config.ConnectionSettings, origin string) adminConnectionPayload {
-	payload := adminConnectionPayload{
-		SourceMode:      connection.SourceMode,
-		ChannelProfile:  connection.ChannelProfile,
-		ChannelProfiles: append([]string(nil), connection.ChannelProfiles...),
-		ChannelGroups:   append([]string(nil), connection.ChannelGroups...),
-		Origin:          origin,
-	}
-	switch connection.SourceMode {
-	case config.SourceModeXtream:
-		payload.BaseURL = connection.XtreamBaseURL
-		payload.Username = connection.XtreamUsername
-		payload.SecretConfigured = strings.TrimSpace(connection.XtreamPassword) != ""
-	case config.SourceModeM3UXMLTV:
-		payload.SecretConfigured = false
-		payload.M3UConfigured = strings.TrimSpace(connection.M3UURL) != ""
-		payload.EPGXMLConfigured = strings.TrimSpace(connection.EPGXMLURL) != ""
-	case config.SourceModeAPIKey:
-		payload.BaseURL = connection.DispatcharrURL
-		payload.SecretConfigured = strings.TrimSpace(connection.DispatcharrAPIKey) != ""
-	default:
-		payload.SourceMode = config.SourceModeDirectLogin
-		payload.BaseURL = connection.DispatcharrURL
-		payload.Username = connection.DispatcharrUser
-		payload.SecretConfigured = strings.TrimSpace(connection.DispatcharrPass) != ""
-	}
-	_, err := config.NormalizeConnection(connection)
-	payload.Configured = err == nil
-	return payload
-}
-
-func connectionFromAdminPayload(payload adminConnectionPayload, current config.ConnectionSettings) config.ConnectionSettings {
-	sameMode := payload.SourceMode == current.SourceMode
-	candidate := config.ConnectionSettings{
-		SourceMode:      payload.SourceMode,
-		ChannelProfile:  payload.ChannelProfile,
-		ChannelProfiles: append([]string(nil), payload.ChannelProfiles...),
-		ChannelGroups:   append([]string(nil), payload.ChannelGroups...),
-	}
-	switch payload.SourceMode {
-	case config.SourceModeAPIKey:
-		candidate.DispatcharrURL = payload.BaseURL
-		if strings.TrimSpace(payload.APIKey) != "" {
-			candidate.DispatcharrAPIKey = payload.APIKey
-		} else if sameMode && strings.TrimRight(strings.TrimSpace(payload.BaseURL), "/") == strings.TrimRight(strings.TrimSpace(current.DispatcharrURL), "/") {
-			candidate.DispatcharrAPIKey = current.DispatcharrAPIKey
-		}
-	case config.SourceModeXtream:
-		candidate.XtreamBaseURL = payload.BaseURL
-		candidate.XtreamUsername = payload.Username
-		if strings.TrimSpace(payload.Password) != "" {
-			candidate.XtreamPassword = payload.Password
-		} else if sameMode && strings.TrimRight(strings.TrimSpace(payload.BaseURL), "/") == strings.TrimRight(strings.TrimSpace(current.XtreamBaseURL), "/") && strings.TrimSpace(payload.Username) == strings.TrimSpace(current.XtreamUsername) {
-			candidate.XtreamPassword = current.XtreamPassword
-		}
-	case config.SourceModeM3UXMLTV:
-		if strings.TrimSpace(payload.M3UURL) != "" {
-			candidate.M3UURL = payload.M3UURL
-		} else if sameMode {
-			candidate.M3UURL = current.M3UURL
-		}
-		if strings.TrimSpace(payload.EPGXMLURL) != "" {
-			candidate.EPGXMLURL = payload.EPGXMLURL
-		} else if sameMode {
-			candidate.EPGXMLURL = current.EPGXMLURL
-		}
-	default:
-		candidate.SourceMode = config.SourceModeDirectLogin
-		candidate.DispatcharrURL = payload.BaseURL
-		candidate.DispatcharrUser = payload.Username
-		if strings.TrimSpace(payload.Password) != "" {
-			candidate.DispatcharrPass = payload.Password
-		} else if sameMode && strings.TrimRight(strings.TrimSpace(payload.BaseURL), "/") == strings.TrimRight(strings.TrimSpace(current.DispatcharrURL), "/") && strings.TrimSpace(payload.Username) == strings.TrimSpace(current.DispatcharrUser) {
-			candidate.DispatcharrPass = current.DispatcharrPass
-		}
-	}
-	return candidate
-}
-
-// CheckConnection probes a source without saving it or refreshing its catalog.
-func CheckConnection(ctx context.Context, connection config.ConnectionSettings) error {
-	switch connection.SourceMode {
-	case config.SourceModeDirectLogin:
-		return dispatcharr.NewLoginClient(connection.DispatcharrURL, connection.DispatcharrUser, connection.DispatcharrPass).TestConnection(ctx)
-	case config.SourceModeAPIKey:
-		return dispatcharr.NewAPIKeyClient(connection.DispatcharrURL, connection.DispatcharrAPIKey).TestConnection(ctx)
-	case config.SourceModeXtream:
-		return xtream.NewClient(connection.XtreamBaseURL, connection.XtreamUsername, connection.XtreamPassword).TestConnection(ctx)
-	case config.SourceModeM3UXMLTV:
-		if err := testConnectionURL(ctx, connection.M3UURL); err != nil {
-			return fmt.Errorf("M3U: %w", err)
-		}
-		if err := testConnectionURL(ctx, connection.EPGXMLURL); err != nil {
-			return fmt.Errorf("XMLTV: %w", err)
-		}
-		return nil
-	default:
-		return fmt.Errorf("unsupported source mode")
-	}
-}
-
-func testConnectionURL(ctx context.Context, target string) error {
-	// Connection URLs can embed credentials (Xtream username/password in the
-	// path or query), so url.Error values are redacted before they reach the
-	// admin UI or logs.
-	request, err := http.NewRequestWithContext(ctx, http.MethodGet, target, nil)
-	if err != nil {
-		return sharedhttp.RedactErrorURL(err)
-	}
-	request.Header.Set("Range", "bytes=0-0")
-	response, err := (&http.Client{Timeout: 12 * time.Second}).Do(request)
-	if err != nil {
-		return sharedhttp.RedactErrorURL(err)
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 400 {
-		return fmt.Errorf("unexpected status %d", response.StatusCode)
-	}
-	return nil
-}
-
-func (s *HTTPRoutesServer) respondAdminSettings(request *pluginv1.HandleHTTPRequest, settings json.RawMessage) (*pluginv1.HandleHTTPResponse, error) {
-	if s.adminSettingsAuthorized(request) {
-		return s.respondJSON(http.StatusOK, settings)
-	}
-	var public map[string]any
-	if err := json.Unmarshal(settings, &public); err != nil {
-		return textResponse(http.StatusInternalServerError, "invalid saved admin settings"), nil
-	}
-	public["ecmEnabled"] = false
-	public["ecmURL"] = ""
-	return s.respondJSON(http.StatusOK, public)
-}
-
-func (s *HTTPRoutesServer) adminSettingsAuthorized(request *pluginv1.HandleHTTPRequest) bool {
-	return requestIsAdmin(request)
-}
-
-// requestIsAdmin reports whether the Silo host identified the caller as an
-// admin. X-Silo-User-Role is trustworthy: the host's plugin HTTP proxy only
-// forwards an allowlist of client headers (accept, content-type, range, ...)
-// and stamps the X-Silo-User-* identity headers itself after authenticating
-// the session, so a browser cannot inject or override this value.
-func requestIsAdmin(request *pluginv1.HandleHTTPRequest) bool {
-	return strings.EqualFold(strings.TrimSpace(headerValue(request.GetHeaders(), "x-silo-user-role")), "admin")
-}
-
-// adminRequiredResponse is the JSON 403 returned when a non-admin calls an
-// admin-only action (force refresh, stopping or deleting recordings).
-func adminRequiredResponse(action string) (*pluginv1.HandleHTTPResponse, error) {
-	body, err := json.Marshal(map[string]any{
-		"ok":      false,
-		"error":   "admin_required",
-		"message": "Only Silo admins can perform this action: " + action + ".",
-	})
-	if err != nil {
-		return nil, err
-	}
-	return &pluginv1.HandleHTTPResponse{
-		StatusCode: http.StatusForbidden,
-		Headers: map[string]string{
-			"cache-control": "no-store",
-			"content-type":  "application/json",
-		},
-		Body: body,
-	}, nil
-}
-
-func headerValue(headers map[string]string, key string) string {
-	for name, value := range headers {
-		if strings.EqualFold(name, key) {
-			return value
-		}
-	}
-	return ""
-}
-
-func (s *HTTPRoutesServer) persistAdminSettings(ctx context.Context, payload map[string]any) error {
-	if s.adminPersister == nil {
-		return nil
-	}
-	return s.adminPersister(ctx, payload)
+	return s.respondJSON(http.StatusOK, s.store.SetPreferences(preferences))
 }
 
 func (s *HTTPRoutesServer) handleFavorite(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
-	return userStateUnavailableResponse(), nil
+	if request.GetMethod() != http.MethodPost {
+		return s.respondJSON(http.StatusOK, s.store.Preferences().Favorites)
+	}
+	var payload toggleRequest
+	if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
+		return textResponse(http.StatusBadRequest, "invalid favorite payload"), nil
+	}
+	if strings.TrimSpace(payload.ID) == "" {
+		return textResponse(http.StatusBadRequest, "missing id"), nil
+	}
+	return s.respondJSON(http.StatusOK, s.store.SetFavorite(payload.ID, payload.Enabled))
 }
 
 func (s *HTTPRoutesServer) handleHiddenCategory(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
-	return userStateUnavailableResponse(), nil
+	if request.GetMethod() != http.MethodPost {
+		return s.respondJSON(http.StatusOK, s.store.Preferences().HiddenCategories)
+	}
+	var payload toggleRequest
+	if err := json.Unmarshal(request.GetBody(), &payload); err != nil {
+		return textResponse(http.StatusBadRequest, "invalid hidden category payload"), nil
+	}
+	if strings.TrimSpace(payload.ID) == "" {
+		return textResponse(http.StatusBadRequest, "missing id"), nil
+	}
+	return s.respondJSON(http.StatusOK, s.store.SetHiddenCategory(payload.ID, payload.Hidden))
 }
 
 func (s *HTTPRoutesServer) handlePlaybackSettings(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
-	return userStateUnavailableResponse(), nil
-}
-
-func userStateUnavailableResponse() *pluginv1.HandleHTTPResponse {
-	return textResponse(http.StatusGone, "user state is stored in the Silo user profile")
+	if request.GetMethod() != http.MethodPost {
+		return s.respondJSON(http.StatusOK, s.store.Preferences().Playback)
+	}
+	var settings cache.PlaybackSettings
+	if err := json.Unmarshal(request.GetBody(), &settings); err != nil {
+		return textResponse(http.StatusBadRequest, "invalid playback settings payload"), nil
+	}
+	return s.respondJSON(http.StatusOK, s.store.SetPlaybackSettings(settings).Playback)
 }
 
 func (s *HTTPRoutesServer) handleWatchStart(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
@@ -1385,8 +434,8 @@ func (s *HTTPRoutesServer) handleWatchStart(request *pluginv1.HandleHTTPRequest)
 	if strings.TrimSpace(payload.ItemKind) == "" {
 		payload.ItemKind = "channel"
 	}
-	session := s.store.StartWatch(payload.ItemKind, payload.ItemID, payload.ItemName)
-	return s.respondJSON(http.StatusOK, map[string]any{"session": session})
+	session, preferences := s.store.StartWatch(payload.ItemKind, payload.ItemID, payload.ItemName)
+	return s.respondJSON(http.StatusOK, map[string]any{"session": session, "preferences": preferences})
 }
 
 func (s *HTTPRoutesServer) handleWatchHeartbeat(request *pluginv1.HandleHTTPRequest) (*pluginv1.HandleHTTPResponse, error) {
@@ -1427,14 +476,13 @@ func (s *HTTPRoutesServer) respondJSON(status int, value any) (*pluginv1.HandleH
 	return &pluginv1.HandleHTTPResponse{
 		StatusCode: int32(status),
 		Headers: map[string]string{
-			"cache-control": "no-store",
-			"content-type":  "application/json",
+			"content-type": "application/json",
 		},
 		Body: payload,
 	}, nil
 }
 
-func playerLibraryAssetResponse(path string) (*pluginv1.HandleHTTPResponse, error) {
+func assetResponse(path string) (*pluginv1.HandleHTTPResponse, error) {
 	payload, err := playerAssets.ReadFile(path)
 	if err != nil {
 		return textResponse(http.StatusNotFound, "asset not found"), nil
@@ -1449,164 +497,22 @@ func playerLibraryAssetResponse(path string) (*pluginv1.HandleHTTPResponse, erro
 	}, nil
 }
 
-func playerUIAssetResponse(path string, contentType string) (*pluginv1.HandleHTTPResponse, error) {
-	payload, err := playerUIAssets.ReadFile(path)
-	if err != nil {
-		return textResponse(http.StatusNotFound, "asset not found"), nil
-	}
-	return &pluginv1.HandleHTTPResponse{
-		StatusCode: http.StatusOK,
-		Headers: map[string]string{
-			"cache-control": "public, max-age=31536000, immutable",
-			"content-type":  contentType,
-		},
-		Body: payload,
-	}, nil
+func playerPageHTML() string {
+	return strings.Replace(playerPageHTMLTemplate, "__PLAYER_LIBRARIES__", playerLibrariesHTML(), 1)
 }
 
-func (s *HTTPRoutesServer) playerPageHTML(request *pluginv1.HandleHTTPRequest) string {
-	body := strings.Replace(playerPageHTMLTemplate, "__SILO_THEME__", html.EscapeString(sanitizeThemeSlug(queryValue(request, "theme"))), 1)
-	assetPrefix := "assets"
-	if request.GetPath() == "/dispatcharr" {
-		assetPrefix = "dispatcharr/assets"
-	}
-	body = strings.ReplaceAll(body, "__ASSET_PREFIX__", assetPrefix)
-	body = strings.ReplaceAll(body, "__ASSET_VERSION__", pluginAssetVersion())
-	body = s.applyUserNavTemplate(body, request.GetPath() == "/dispatcharr/sports" && s.sportsFeatureEnabled())
-	if request.GetPath() == "/dispatcharr/admin" {
-		body = strings.Replace(body, "</body>", adminLicenseNoticesHTML()+"</body>", 1)
-		body = removeTemplateBlock(body, "<!-- USER_NAV_START -->", "<!-- USER_NAV_END -->")
-		body = replaceTemplateBlock(body, "<!-- USER_TOPBAR_START -->", "<!-- USER_TOPBAR_END -->", adminTopbarHTML())
-		body = strings.ReplaceAll(body, "__APP_TITLE__", "Dispatcharr Admin")
-		return strings.Replace(body, "__ROUTE_CLASS__", "is-admin", 1)
-	}
-	if request.GetPath() == "/dispatcharr/sports" && s.sportsFeatureEnabled() {
-		body = strings.ReplaceAll(body, "__APP_TITLE__", "Sports")
-		return strings.Replace(body, "__ROUTE_CLASS__", "is-sports-app", 1)
-	}
-	body = strings.ReplaceAll(body, "__APP_TITLE__", html.EscapeString(s.appDisplayName()))
-	return strings.Replace(body, "__ROUTE_CLASS__", "", 1)
-}
-
-// applyUserNavTemplate decides tab labels and visibility on the server so the
-// header does not change once the app data loads.
-func (s *HTTPRoutesServer) applyUserNavTemplate(body string, sportsApp bool) string {
-	browseView, browseLabel := "guide", "Guide"
-	if asStringValue(s.normalizedAdminSettings()["sideMenuMode"]) == "channels" {
-		browseView, browseLabel = "channels", "Channels"
-	}
-	hidden := func(hide bool) string {
-		if hide {
-			return " hidden"
+func playerLibrariesHTML() string {
+	var builder strings.Builder
+	for _, path := range []string{"assets/hls.min.js", "assets/mpegts.min.js"} {
+		payload, err := playerAssets.ReadFile(path)
+		if err != nil {
+			continue
 		}
-		return ""
+		builder.WriteString("<script>")
+		builder.WriteString(strings.ReplaceAll(string(payload), "</script", "<\\/script"))
+		builder.WriteString("</script>\n")
 	}
-	body = strings.ReplaceAll(body, "__BROWSE_VIEW__", browseView)
-	body = strings.ReplaceAll(body, "__BROWSE_LABEL__", browseLabel)
-	body = strings.ReplaceAll(body, "__LIVE_TAB_HIDDEN__", hidden(sportsApp))
-	body = strings.ReplaceAll(body, "__SPORTS_TAB_HIDDEN__", hidden(!sportsApp && (!s.sportsFeatureEnabled() || s.sportsAppEnabled())))
-	return strings.ReplaceAll(body, "__RECORDINGS_TAB_HIDDEN__", hidden(sportsApp || !s.recordingsEnabled()))
-}
-
-func (s *HTTPRoutesServer) sportsAppEnabled() bool {
-	return s.sportsFeatureEnabled() && s.adminFlag("separateSportsApp", false)
-}
-
-func (s *HTTPRoutesServer) appDisplayName() string {
-	return asStringValue(s.normalizedAdminSettings()["appDisplayName"])
-}
-
-func (s *HTTPRoutesServer) hlsBufferSeconds() int {
-	value := s.normalizedAdminSettings()["hlsBufferSeconds"]
-	switch typed := value.(type) {
-	case int:
-		return typed
-	case float64:
-		return int(typed)
-	default:
-		return defaultHLSBufferSeconds
-	}
-}
-
-func (s *HTTPRoutesServer) normalizedAdminSettings() map[string]any {
-	var raw json.RawMessage
-	if s.store != nil && s.store.HasAdminSettings() {
-		raw = s.store.AdminSettings()
-	} else {
-		if s.adminStorage != nil {
-			if saved, ok, err := s.adminStorage.Load(); err == nil && ok {
-				raw = saved
-				if s.store != nil {
-					s.store.SetAdminSettings(saved)
-				}
-			}
-		}
-		if len(raw) == 0 && s.settingsProvider != nil {
-			raw = s.settingsProvider().AdminSettings
-		}
-	}
-	payload := map[string]any{}
-	if len(raw) > 0 {
-		_ = json.Unmarshal(raw, &payload)
-	}
-	return normalizeAdminSettingsPayload(payload)
-}
-
-func pluginAssetVersion() string {
-	assetVersionOnce.Do(func() {
-		hash := sha256.New()
-		for _, asset := range []struct {
-			fs   interface{ ReadFile(string) ([]byte, error) }
-			path string
-		}{
-			{playerUIAssets, "ui/styles.css"},
-			{playerUIAssets, "ui/lineup.js"},
-			{playerUIAssets, "ui/sports_replays.js"},
-			{playerUIAssets, "ui/sports_hub.js"},
-			{playerUIAssets, "ui/app.js"},
-			{playerUIAssets, "ui/guide.js"},
-			{playerUIAssets, "ui/player.js"},
-			{playerAssets, "assets/hls.min.js"},
-			{playerAssets, "assets/mpegts.min.js"},
-		} {
-			if payload, err := asset.fs.ReadFile(asset.path); err == nil {
-				_, _ = hash.Write(payload)
-			}
-		}
-		assetVersionValue = hex.EncodeToString(hash.Sum(nil))[:16]
-	})
-	return assetVersionValue
-}
-
-func removeTemplateBlock(body string, startMarker string, endMarker string) string {
-	return replaceTemplateBlock(body, startMarker, endMarker, "")
-}
-
-func replaceTemplateBlock(body string, startMarker string, endMarker string, replacement string) string {
-	start := strings.Index(body, startMarker)
-	if start < 0 {
-		return body
-	}
-	end := strings.Index(body[start:], endMarker)
-	if end < 0 {
-		return body
-	}
-	end += start + len(endMarker)
-	return body[:start] + replacement + body[end:]
-}
-
-func adminTopbarHTML() string {
-	return `<aside class="admin-sidebar"><a class="admin-brand" href="/admin"><span class="admin-brand-mark"><i></i><i></i><i></i></span><strong>Silo</strong></a><div class="admin-sidebar-label">Dispatcharr</div><nav id="admin-tabs" class="admin-sidebar-nav" aria-label="Dispatcharr Admin sections"></nav><div class="admin-sidebar-spacer"></div><a class="admin-sidebar-link" href="../dispatcharr"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M4.5 6.75A2.25 2.25 0 0 1 6.75 4.5h10.5A2.25 2.25 0 0 1 19.5 6.75v10.5a2.25 2.25 0 0 1-2.25 2.25H6.75a2.25 2.25 0 0 1-2.25-2.25V6.75Z"/><path stroke-linecap="round" stroke-linejoin="round" d="M9 9.25v5.5l5-2.75-5-2.75Z"/></svg><span>Open Live TV</span></a><a class="admin-sidebar-link" href="/admin"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5"/></svg><span>Back to Admin</span></a></aside><header class="admin-topbar"><div class="admin-identity"><div><h1>Dispatcharr</h1><p>Manage the Live TV source, guide behavior, and integrations.</p></div></div><div id="admin-actions" class="admin-actions"></div></header>`
-}
-
-func sanitizeThemeSlug(value string) string {
-	value = strings.TrimSpace(strings.ToLower(value))
-	return strings.Map(func(r rune) rune {
-		if r >= 'a' && r <= 'z' || r >= '0' && r <= '9' || r == '-' || r == '_' {
-			return r
-		}
-		return -1
-	}, value)
+	return builder.String()
 }
 
 func (s *HTTPRoutesServer) resolveStreamURL(channelID string) (string, error) {
@@ -1670,7 +576,7 @@ func (s *HTTPRoutesServer) dispatcharrClient() (*dispatcharr.Client, error) {
 		return nil, fmt.Errorf("dispatcharr settings are unavailable")
 	}
 	settings := s.settingsProvider()
-	switch settings.EffectiveSourceMode() {
+	switch settings.SourceMode {
 	case config.SourceModeDirectLogin:
 		if strings.TrimSpace(settings.DispatcharrURL) == "" || strings.TrimSpace(settings.DispatcharrUser) == "" || strings.TrimSpace(settings.DispatcharrPass) == "" {
 			return nil, fmt.Errorf("dispatcharr direct login settings are incomplete")
@@ -1760,11 +666,8 @@ func enrichRecording(client *dispatcharr.Client, recording json.RawMessage) json
 	id := fmt.Sprint(object["id"])
 	playbackURL := recordingPlaybackURL(client, id, object)
 	object["_silo"] = map[string]any{
-		"recording_id":   id,
 		"playback_url":   playbackURL,
 		"playback_owner": "dispatcharr",
-		"can_stop":       recordingStatusAllowsStop(object),
-		"can_delete":     true,
 	}
 	out, err := json.Marshal(object)
 	if err != nil {
@@ -1787,16 +690,6 @@ func recordingPlaybackURL(client *dispatcharr.Client, id string, object map[stri
 	return client.AbsoluteURL("/api/channels/recordings/" + strings.TrimSpace(id) + "/file/")
 }
 
-func recordingStatusAllowsStop(object map[string]any) bool {
-	status := strings.ToLower(strings.TrimSpace(fmt.Sprint(object["status"])))
-	if custom, ok := object["custom_properties"].(map[string]any); ok {
-		if raw := strings.ToLower(strings.TrimSpace(fmt.Sprint(custom["status"]))); raw != "" && raw != "<nil>" {
-			status = raw
-		}
-	}
-	return status == "pending" || status == "scheduled" || status == "recording"
-}
-
 func xtreamConnectionSettings(settings config.Settings) (string, string, string) {
 	if settings.SourceMode == config.SourceModeDirectLogin {
 		return settings.DispatcharrURL, settings.DispatcharrUser, settings.DispatcharrPass
@@ -1804,43 +697,17 @@ func xtreamConnectionSettings(settings config.Settings) (string, string, string)
 	return settings.XtreamBaseURL, settings.XtreamUsername, settings.XtreamPassword
 }
 
-func normalizeChannelIDs(ids []string) []string {
-	seen := map[string]bool{}
-	normalized := make([]string, 0, len(ids))
-	for _, id := range ids {
-		value := strings.TrimSpace(id)
-		if value == "" || seen[value] {
-			continue
-		}
-		seen[value] = true
-		normalized = append(normalized, value)
+func programsForChannel(programs []model.Program, channelID string) []model.Program {
+	if strings.TrimSpace(channelID) == "" {
+		return append([]model.Program(nil), programs...)
 	}
-	return normalized
-}
-
-func currentProgramCountForChannels(programs []model.Program, channelIDs []string, nowUnix int64) int {
-	if len(channelIDs) == 0 {
-		return 0
-	}
-	channelSet := make(map[string]bool, len(channelIDs))
-	for _, id := range channelIDs {
-		channelSet[id] = true
-	}
-	channelsWithPrograms := map[string]bool{}
+	filtered := make([]model.Program, 0, len(programs))
 	for _, program := range programs {
-		if !channelSet[program.ChannelID] {
-			continue
-		}
-		start := program.StartUnix
-		end := program.EndUnix
-		if end == 0 {
-			end = start + 1800
-		}
-		if start <= nowUnix+1800 && end >= nowUnix-300 {
-			channelsWithPrograms[program.ChannelID] = true
+		if program.ChannelID == channelID {
+			filtered = append(filtered, program)
 		}
 	}
-	return len(channelsWithPrograms)
+	return filtered
 }
 
 func liveCategories(snapshot cache.Snapshot) []model.Category {
@@ -1856,7 +723,7 @@ func liveCategories(snapshot cache.Snapshot) []model.Category {
 		seen[channel.CategoryID] = true
 		name := channel.CategoryName
 		if name == "" {
-			name = "Group " + channel.CategoryID
+			name = "Category " + channel.CategoryID
 		}
 		categories = append(categories, model.Category{ID: channel.CategoryID, Name: name, Kind: "live"})
 	}
@@ -1866,59 +733,19 @@ func liveCategories(snapshot cache.Snapshot) []model.Category {
 	return categories
 }
 
-func appCapabilities(sourceMode model.SourceMode) AppCapabilities {
+func appCapabilities(preferences cache.Preferences) AppCapabilities {
 	return AppCapabilities{
 		LiveTV:                true,
 		Guide:                 true,
 		VOD:                   true,
 		Series:                true,
-		Recordings:            dvrEnabledForSource(sourceMode),
+		Recordings:            true,
 		Favorites:             true,
 		HiddenCategories:      true,
-		BackendProxySupported: false,
-		StreamMode:            "redirect",
+		BackendProxySupported: preferences.Playback.BackendProxySupported,
+		StreamMode:            preferences.Playback.StreamMode,
 		NativeLiveTVExport:    false,
 	}
-}
-
-func (s *HTTPRoutesServer) appCapabilities(sourceMode model.SourceMode) AppCapabilities {
-	caps := appCapabilities(sourceMode)
-	caps.Recordings = caps.Recordings && s.adminFlag("allowRecordingsByDefault", true)
-	return caps
-}
-
-func dvrEnabledForSource(sourceMode model.SourceMode) bool {
-	return sourceMode == model.SourceModeDirectLogin || sourceMode == model.SourceModeAPIKey
-}
-
-func (s *HTTPRoutesServer) recordingsEnabled() bool {
-	if s == nil || s.store == nil {
-		return false
-	}
-	if !dvrEnabledForSource(s.store.Current().Catalog.Source.Mode) {
-		return false
-	}
-	return s.adminFlag("allowRecordingsByDefault", true)
-}
-
-func recordingsUnavailableReason(s *HTTPRoutesServer) string {
-	if s != nil && s.store != nil && dvrEnabledForSource(s.store.Current().Catalog.Source.Mode) && !s.adminFlag("allowRecordingsByDefault", true) {
-		return "Recordings are turned off by Dispatcharr Admin."
-	}
-	return "Recordings require Dispatcharr Direct Connect."
-}
-
-func (s *HTTPRoutesServer) sportsFeatureEnabled() bool {
-	return s.adminFlag("sportsEnabled", true)
-}
-
-func (s *HTTPRoutesServer) adminFlag(key string, fallback bool) bool {
-	if s == nil || s.store == nil {
-		return fallback
-	}
-	settings := map[string]any{}
-	_ = json.Unmarshal(s.store.AdminSettings(), &settings)
-	return boolSetting(settings, key, fallback)
 }
 
 func queryValue(request *pluginv1.HandleHTTPRequest, key string) string {
@@ -1962,8 +789,7 @@ func htmlResponse(status int, body string) *pluginv1.HandleHTTPResponse {
 	return &pluginv1.HandleHTTPResponse{
 		StatusCode: int32(status),
 		Headers: map[string]string{
-			"cache-control": "no-store",
-			"content-type":  "text/html; charset=utf-8",
+			"content-type": "text/html; charset=utf-8",
 		},
 		Body: []byte(body),
 	}
@@ -1978,3 +804,1447 @@ func textResponse(status int, message string) *pluginv1.HandleHTTPResponse {
 		Body: []byte(message),
 	}
 }
+
+const playerPageHTMLTemplate = `<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Live TV</title>
+    __PLAYER_LIBRARIES__
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #171717;
+        --rail: #1d1d1f;
+        --rail-2: #222225;
+        --panel: #2b2b2d;
+        --panel-2: #353536;
+        --line: #3e3e40;
+        --text: #f5f3ef;
+        --muted: #a7a5a0;
+        --accent: #ff2f7d;
+        --green: #173f31;
+        --purple: #3b2147;
+        --red: #4a211e;
+        --blue: #1d3347;
+        --warn: #f4c95f;
+      }
+      * { box-sizing: border-box; }
+      body { margin: 0; min-height: 100vh; overflow: hidden; background: var(--bg); color: var(--text); font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+      button, input, select { font: inherit; }
+      button { cursor: pointer; }
+      .shell { display: grid; grid-template-columns: 17rem minmax(0, 1fr); height: 100vh; }
+      .shell.is-player { grid-template-columns: minmax(0, 1fr); background: #050505; }
+      .rail { display: flex; flex-direction: column; min-height: 0; border-right: 1px solid var(--line); background: linear-gradient(135deg, #19191a, #201e20); padding: 1rem; }
+      .shell.is-player .rail { display: none; }
+      .brand { display: flex; align-items: center; gap: 0.65rem; margin-bottom: 1.25rem; }
+      .brand h1 { margin: 0; font-size: 1.55rem; font-weight: 900; letter-spacing: 0; }
+      .back { width: 2.25rem; height: 2.25rem; color: var(--muted); text-decoration: none; border: 1px solid var(--line); border-radius: 999px; display: inline-grid; place-items: center; flex: 0 0 auto; }
+      .back:hover { color: var(--text); background: var(--panel); }
+      .back svg { width: 1.05rem; height: 1.05rem; display: block; }
+      .source-icon { width: 1.45rem; height: 1.45rem; border-radius: 999px; display: inline-grid; place-items: center; background: var(--accent); }
+      .nav { display: grid; gap: 0.28rem; margin-bottom: 1rem; }
+      .nav button { width: 100%; border: 0; border-radius: 0.65rem; background: transparent; color: var(--muted); display: flex; align-items: center; gap: 0.65rem; padding: 0.7rem 0.72rem; text-align: left; font-weight: 750; }
+      .nav button.active, .nav button:hover { background: #2a292b; color: var(--text); }
+      .nav svg { width: 1.15rem; height: 1.15rem; flex: 0 0 auto; stroke-width: 1.9; }
+      .nav small { margin-left: auto; color: var(--muted); }
+      .channel-row { width: 100%; border: 0; border-radius: 0.75rem; background: transparent; color: var(--text); display: grid; grid-template-columns: 3.1rem minmax(0, 1fr) 1.8rem; align-items: center; gap: 0.65rem; padding: 0.45rem; text-align: left; }
+      .channel-row:hover, .channel-row.active { background: #2a292b; }
+      .logo { width: 3rem; height: 2.05rem; object-fit: contain; border-radius: 0.5rem; background: #121213; }
+      .channel-row strong, .tile strong, .program strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .muted { color: var(--muted); }
+      .star { color: var(--warn); font-size: 1rem; }
+      .main { min-width: 0; overflow: auto; padding: 1rem 1.25rem 2rem; }
+      .shell.is-player .main { padding: 0; overflow: hidden; background: #050505; }
+      .topbar { display: flex; align-items: center; justify-content: flex-end; gap: 0.65rem; margin-bottom: 0.85rem; position: sticky; top: 0; z-index: 5; background: linear-gradient(180deg, var(--bg) 70%, rgba(23,23,23,0)); padding-bottom: 0.65rem; }
+      .shell.is-player .topbar, .shell.is-guide .topbar { display: none; }
+      .title { display: flex; align-items: center; gap: 0.55rem; min-width: 0; }
+      .title h2 { margin: 0; font-size: 1.35rem; }
+      .status { color: var(--muted); font-size: 0.82rem; white-space: nowrap; }
+      .search { border: 1px solid var(--line); border-radius: 999px; background: #242426; color: var(--text); padding: 0.62rem 0.85rem; min-width: min(24rem, 40vw); }
+      .topbar .search { width: min(32rem, 100%); }
+      .refresh-button { width: 2.45rem; height: 2.45rem; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); color: var(--text); display: inline-grid; place-items: center; flex: 0 0 auto; }
+      .refresh-button:hover { background: var(--panel-2); }
+      .refresh-button:disabled { cursor: default; opacity: 0.7; }
+      .refresh-button svg { width: 1.1rem; height: 1.1rem; display: block; }
+      .refresh-button.is-loading svg { animation: spin 880ms linear infinite; }
+      .section-title { display: flex; align-items: center; justify-content: space-between; gap: 1rem; margin: 1rem 0 0.55rem; color: var(--muted); font-size: 0.95rem; font-weight: 850; }
+      .row-scroll { display: flex; gap: 0.6rem; overflow-x: auto; padding-bottom: 0.3rem; }
+      .continue-card { flex: 0 0 15.5rem; border: 0; border-radius: 0.7rem; background: transparent; color: var(--text); text-align: left; }
+      .poster-box { height: 8.7rem; border-radius: 0.65rem; background: #b19398; display: grid; place-items: center; overflow: hidden; margin-bottom: 0.45rem; }
+      .poster-box img { width: 100%; height: 100%; object-fit: contain; }
+      .poster-box span { font-size: 2.8rem; font-weight: 950; }
+      .progress { height: 0.22rem; border-radius: 999px; background: rgba(255,255,255,0.14); overflow: hidden; margin: -0.75rem 0.85rem 0.6rem; position: relative; }
+      .progress i { display: block; height: 100%; width: 62%; background: white; border-radius: inherit; }
+      .home-guide { overflow-x: auto; padding-bottom: 0.15rem; }
+      .home-guide .guide-page { min-width: 0; }
+      .program { min-height: 3.05rem; border: 0; border-radius: 0.55rem; color: var(--text); text-align: left; padding: 0.48rem 0.65rem; background: var(--purple); }
+      .program.green { background: var(--green); }
+      .program.red { background: var(--red); }
+      .program.blue { background: var(--blue); }
+      .program.gray { background: var(--panel); }
+      .program time { color: var(--muted); font-size: 0.78rem; display: block; }
+      .category-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(8.7rem, 1fr)); gap: 0.5rem; }
+      .tile { border: 0; border-radius: 0.65rem; background: var(--panel); color: var(--text); min-height: 3.85rem; text-align: left; padding: 0.75rem 0.85rem; font-weight: 850; }
+      .tile:hover, .tile.active { background: var(--panel-2); }
+      .guide-page { min-width: 0; }
+      .guide-tools { display: flex; align-items: center; gap: 0.65rem; margin-bottom: 0.7rem; }
+      .guide-tools .select { flex: 0 1 26rem; min-width: min(24rem, 45vw); }
+      .guide-tools .search { flex: 1 1 28rem; min-width: 16rem; margin-left: auto; }
+      .select { border: 1px solid var(--line); border-radius: 999px; color: var(--text); background: var(--panel); padding: 0.55rem 0.75rem; }
+      .guide-scroll { --epg-logo-col: 6.8rem; --epg-slot: 12rem; --epg-row-h: 3.7rem; overflow-x: auto; overflow-y: visible; padding-bottom: 0.45rem; }
+      .guide-timeline { width: calc(var(--epg-logo-col) + var(--epg-width)); min-width: calc(var(--epg-logo-col) + var(--epg-width)); }
+      .time-head { display: grid; grid-template-columns: var(--epg-logo-col) repeat(var(--epg-slots), var(--epg-slot)); gap: 0.25rem; color: var(--muted); font-weight: 850; margin-bottom: 0.35rem; }
+      .time-head span { min-width: 0; padding: 0 0.25rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .time-head span:first-child { position: sticky; left: 0; z-index: 3; color: var(--text); font-size: 1.15rem; background: var(--bg); }
+      .epg-row { display: grid; grid-template-columns: var(--epg-logo-col) var(--epg-width); gap: 0.25rem; height: var(--epg-row-h); margin-bottom: 0.35rem; overflow: visible; }
+      .epg-channel { position: sticky; left: 0; z-index: 2; border: 0; border-radius: 0.55rem; background: var(--bg); color: white; display: grid; place-items: center; padding: 0; height: var(--epg-row-h); min-height: var(--epg-row-h); overflow: hidden; }
+      .epg-channel .logo { width: 5.7rem; height: 3.25rem; border-radius: 0; background: transparent; }
+      .epg-programs { position: relative; height: var(--epg-row-h); min-width: 0; overflow: hidden; }
+      .epg-cell { position: absolute; top: 0; height: var(--epg-row-h); min-height: 0; border: 0; border-radius: 0.55rem; text-align: left; color: var(--text); background: var(--panel); padding: 0.48rem 0.7rem; min-width: 0; overflow: hidden; white-space: nowrap; }
+      .epg-cell time, .epg-cell strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .epg-cell .epg-play { position: absolute; inset: 0; z-index: 1; border: 0; border-radius: inherit; background: transparent; color: inherit; text-align: left; padding: 0.48rem 0.7rem; display: grid; align-content: center; min-width: 0; }
+      .epg-cell .epg-schedule { position: absolute; right: 0.4rem; top: 50%; z-index: 2; transform: translateY(-50%); width: 1.8rem; height: 1.8rem; border: 1px solid rgba(255,255,255,0.22); border-radius: 999px; color: white; background: rgba(0,0,0,0.34); display: inline-grid; place-items: center; opacity: 0; transition: opacity 140ms ease, background 140ms ease; }
+      .epg-cell .epg-schedule svg { width: 1rem; height: 1rem; }
+      .epg-cell:hover .epg-schedule, .epg-cell .epg-schedule:focus-visible { opacity: 1; }
+      .epg-cell .epg-schedule:hover { background: rgba(255,47,125,0.86); }
+      .player-view { display: grid; grid-template-columns: minmax(0, 1fr) 22rem; gap: 1rem; align-items: start; }
+      video { width: 100%; aspect-ratio: 16 / 9; background: #050505; border: 1px solid var(--line); border-radius: 0.75rem; }
+      .playback-shell { position: relative; min-height: 100vh; overflow: hidden; background: #050505; display: grid; place-items: center; }
+      .playback-stage { position: relative; width: min(100%, calc(100vh * 16 / 9)); max-height: 100vh; aspect-ratio: 16 / 9; overflow: hidden; background: #050505; }
+      .playback-video { position: absolute; inset: 0; width: 100%; height: 100%; aspect-ratio: auto; object-fit: cover; border: 0; border-radius: 0; background: #050505; }
+      .playback-scrim { pointer-events: none; position: absolute; inset: 0; background: linear-gradient(180deg, rgba(0,0,0,0.82) 0%, rgba(0,0,0,0.26) 16%, rgba(0,0,0,0.02) 46%, rgba(0,0,0,0.24) 64%, rgba(0,0,0,0.92) 100%); transition: opacity 220ms ease; }
+      .player-top { position: absolute; inset: 1.25rem 1.25rem auto; display: flex; align-items: center; justify-content: space-between; gap: 1rem; z-index: 2; }
+      .player-top, .player-bottom { transition: opacity 220ms ease, transform 220ms ease; }
+      .playback-shell.is-idle { cursor: none; }
+      .playback-shell.is-idle .playback-scrim { opacity: 0; }
+      .playback-shell.is-idle .player-top { opacity: 0; pointer-events: none; transform: translateY(-0.5rem); }
+      .playback-shell.is-idle .player-bottom { opacity: 0; pointer-events: none; transform: translateY(0.75rem); }
+      .player-top-actions, .player-bottom-actions { display: flex; align-items: center; gap: 0.55rem; }
+      .player-audio, .player-volume, .player-more { position: relative; }
+      .player-icon, .player-chip { border: 1px solid rgba(255,255,255,0.12); background: rgba(30,30,31,0.72); color: white; box-shadow: 0 0.35rem 1.4rem rgba(0,0,0,0.2); backdrop-filter: blur(18px); }
+      .player-icon { width: 2.65rem; height: 2.65rem; border-radius: 999px; display: inline-grid; place-items: center; font-size: 1.15rem; }
+      .player-chip { min-height: 2.4rem; border-radius: 999px; padding: 0 0.82rem; font-weight: 850; display: inline-flex; align-items: center; gap: 0.35rem; }
+      .player-icon svg, .player-chip svg, .menu-icon svg { width: 1.15rem; height: 1.15rem; display: block; stroke-width: 1.85; }
+      .player-chip svg:last-child { width: 0.95rem; height: 0.95rem; opacity: 0.72; }
+      .player-icon:hover, .player-chip:hover { background: rgba(52,52,54,0.86); }
+      .player-icon.active, .player-icon.favorite.active { color: white; background: rgba(255,47,116,0.9); border-color: rgba(255,255,255,0.28); }
+      .player-exit { border: 0; background: transparent; color: white; display: inline-flex; align-items: center; gap: 0.55rem; padding: 0; font-weight: 850; text-shadow: 0 0.15rem 0.85rem rgba(0,0,0,0.72); }
+      .player-exit .player-icon { box-shadow: none; }
+      .player-exit span { font-size: 0.92rem; }
+      .player-center-button { position: absolute; left: 50%; top: 50%; z-index: 2; transform: translate(-50%, -50%) scale(1); width: 4.8rem; height: 4.8rem; border-radius: 999px; border: 1px solid rgba(255,255,255,0.2); background: rgba(245,245,245,0.94); color: #050505; display: inline-grid; place-items: center; box-shadow: 0 1rem 2.5rem rgba(0,0,0,0.34); transition: opacity 180ms ease, transform 180ms ease; }
+      .player-center-button svg { width: 2rem; height: 2rem; display: block; }
+      .player-center-button.hidden { opacity: 0; pointer-events: none; transform: translate(-50%, -50%) scale(0.94); }
+      .player-center-button.loading svg { animation: spin 880ms linear infinite; }
+      @keyframes spin { to { transform: rotate(360deg); } }
+      .player-menu { position: absolute; top: calc(100% + 0.45rem); right: 0; display: none; min-width: 13rem; max-width: min(18rem, 70vw); padding: 0.35rem; border: 1px solid rgba(255,255,255,0.14); border-radius: 0.8rem; background: rgba(20,20,21,0.94); box-shadow: 0 1rem 2rem rgba(0,0,0,0.36); backdrop-filter: blur(18px); }
+      .player-menu.open { display: grid; gap: 0.2rem; }
+      .player-menu button { border: 0; border-radius: 0.55rem; background: transparent; color: rgba(255,255,255,0.82); padding: 0.55rem 0.65rem; text-align: left; font-weight: 750; }
+      .player-menu button:hover, .player-menu button.active { background: rgba(255,255,255,0.1); color: white; }
+      .volume-popover { position: absolute; top: calc(100% + 0.45rem); right: 0; display: none; width: 12rem; padding: 0.75rem 0.8rem; border: 1px solid rgba(255,255,255,0.14); border-radius: 0.8rem; background: rgba(20,20,21,0.94); box-shadow: 0 1rem 2rem rgba(0,0,0,0.36); backdrop-filter: blur(18px); }
+      .volume-popover.open { display: grid; grid-template-columns: 2rem minmax(0, 1fr) 2.5rem; gap: 0.6rem; align-items: center; }
+      .volume-popover input { width: 100%; accent-color: white; }
+      .volume-value { color: rgba(255,255,255,0.74); font-size: 0.78rem; font-weight: 850; text-align: right; }
+      .player-bottom { position: absolute; inset: auto 0 0; z-index: 2; padding: 0 1.25rem 1.15rem; background: linear-gradient(180deg, transparent, rgba(0,0,0,0.54) 32%, rgba(0,0,0,0.86)); }
+      .player-meta { min-width: 0; max-width: min(45rem, 64vw); text-shadow: 0 0.15rem 1rem rgba(0,0,0,0.65); }
+      .player-logo { width: 3.6rem; height: 2.45rem; object-fit: contain; border-radius: 0.55rem; background: rgba(255,255,255,0.82); margin-bottom: 0.45rem; padding: 0.18rem; }
+      .player-logo-fallback { display: inline-grid; place-items: center; color: white; background: #b19398; font-weight: 950; }
+      .player-kicker { font-size: 0.82rem; font-weight: 900; color: rgba(255,255,255,0.82); }
+      .player-title { margin: 0.18rem 0 0.18rem; font-size: clamp(1.45rem, 2.25vw, 2.35rem); line-height: 1.02; letter-spacing: 0; }
+      .player-description { margin: 0; color: rgba(255,255,255,0.78); font-size: 0.92rem; max-width: 42rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .player-tags { display: flex; gap: 0.35rem; margin-top: 0.55rem; flex-wrap: wrap; }
+      .player-tag { border-radius: 0.25rem; background: rgba(255,255,255,0.12); color: white; font-size: 0.67rem; padding: 0.18rem 0.33rem; font-weight: 850; }
+      .timeline { display: grid; grid-template-columns: 4.2rem minmax(0,1fr) 11rem; gap: 0.65rem; align-items: center; color: white; font-size: 0.76rem; font-weight: 850; margin-top: 0.9rem; }
+      .timeline-bar { position: relative; height: 0.48rem; border-radius: 999px; background: rgba(255,255,255,0.16); overflow: visible; }
+      .timeline-fill { position: absolute; inset: 0 auto 0 0; width: 41%; border-radius: inherit; background: rgba(255,255,255,0.92); }
+      .timeline-knob { position: absolute; left: 41%; top: 50%; width: 0.85rem; height: 0.85rem; margin-left: -0.42rem; margin-top: -0.42rem; border-radius: 999px; background: white; }
+      .live-dot { display: inline-block; width: 0.45rem; height: 0.45rem; border-radius: 999px; background: #ff334d; margin-right: 0.3rem; vertical-align: middle; }
+      .player-toast { position: absolute; right: 1.25rem; top: 4.55rem; z-index: 3; opacity: 0; transform: translateY(-0.4rem); pointer-events: none; transition: opacity 160ms ease, transform 160ms ease; max-width: min(24rem, calc(100vw - 2.5rem)); padding: 0.65rem 0.85rem; border: 1px solid rgba(255,255,255,0.14); border-radius: 999px; background: rgba(20,20,21,0.9); color: white; font-size: 0.82rem; font-weight: 800; box-shadow: 0 1rem 2rem rgba(0,0,0,0.36); backdrop-filter: blur(18px); }
+      .player-toast.show { opacity: 1; transform: translateY(0); }
+      .app-toast { position: fixed; left: 50%; bottom: 1.5rem; z-index: 80; transform: translateX(-50%) translateY(0.6rem); opacity: 0; pointer-events: none; border: 1px solid rgba(255,255,255,0.14); border-radius: 999px; background: rgba(20,20,21,0.92); color: white; padding: 0.7rem 1rem; font-weight: 850; box-shadow: 0 0.75rem 2rem rgba(0,0,0,0.35); transition: opacity 160ms ease, transform 160ms ease; }
+      .app-toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+      .player-guide-button.active { background: rgba(255,255,255,0.18); }
+      .player-guide-panel { position: absolute; top: 5rem; right: 1.25rem; bottom: 8.5rem; z-index: 3; display: none; width: min(30rem, calc(100vw - 3rem)); overflow: hidden; border: 1px solid rgba(255,255,255,0.13); border-radius: 1rem; background: rgba(17,17,18,0.88); box-shadow: 0 1.2rem 2.4rem rgba(0,0,0,0.42); backdrop-filter: blur(22px); }
+      .player-guide-panel.open { display: grid; grid-template-rows: auto minmax(0, 1fr); }
+      .player-guide-head { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.85rem 0.95rem; border-bottom: 1px solid rgba(255,255,255,0.08); color: white; }
+      .player-guide-head strong { display: block; font-size: 0.92rem; }
+      .player-guide-head span { display: block; color: rgba(255,255,255,0.58); font-size: 0.75rem; font-weight: 750; }
+      .player-guide-list { overflow: auto; padding: 0.45rem; }
+      .player-guide-row { width: 100%; border: 0; border-radius: 0.75rem; background: transparent; color: white; display: grid; grid-template-columns: 3.6rem minmax(0, 1fr); gap: 0.7rem; align-items: center; padding: 0.5rem; text-align: left; }
+      .player-guide-row:hover, .player-guide-row.active { background: rgba(255,255,255,0.1); }
+      .player-guide-row .logo { width: 3.2rem; height: 2.15rem; border-radius: 0.42rem; }
+      .player-guide-row strong, .player-guide-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .player-guide-row strong { font-size: 0.86rem; }
+      .player-guide-row small { margin-top: 0.12rem; color: rgba(255,255,255,0.62); font-size: 0.72rem; font-weight: 750; }
+      .player-more-menu { position: absolute; top: calc(100% + 0.45rem); right: 0; z-index: 4; display: none; width: min(25rem, 84vw); overflow: hidden; border: 1px solid rgba(255,255,255,0.14); border-radius: 1rem; background: rgba(20,20,21,0.94); box-shadow: 0 1.2rem 2.4rem rgba(0,0,0,0.42); backdrop-filter: blur(22px); }
+      .player-more-menu.open { display: block; }
+      .player-more-kicker { padding: 0.8rem 0.95rem 0.35rem; color: rgba(255,255,255,0.56); font-size: 0.75rem; font-weight: 850; }
+      .player-more-menu button { width: 100%; border: 0; background: transparent; color: white; display: grid; grid-template-columns: 2rem minmax(0, 1fr); gap: 0.65rem; align-items: center; padding: 0.72rem 0.95rem; text-align: left; font-weight: 820; }
+      .menu-icon { width: 2rem; height: 2rem; display: inline-grid; place-items: center; color: rgba(255,255,255,0.78); }
+      .player-more-menu button:hover { background: rgba(255,255,255,0.1); }
+      .player-more-menu button small { display: block; margin-top: 0.12rem; color: rgba(255,255,255,0.58); font-size: 0.72rem; font-weight: 720; }
+      .player-more-separator { height: 1px; background: rgba(255,255,255,0.08); margin: 0.35rem 0; }
+      .player-bottom-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 1.2rem; align-items: end; }
+      .player-bottom-actions { align-self: end; padding-bottom: 1.25rem; }
+      .now-card, .settings-card { border: 1px solid var(--line); background: var(--rail-2); border-radius: 0.8rem; padding: 0.85rem; }
+      .recording-toolbar { display: flex; justify-content: flex-end; margin-bottom: 0.75rem; }
+      .recording-refresh { border: 1px solid var(--line); border-radius: 999px; color: var(--text); background: var(--panel); padding: 0.55rem 0.8rem; font-weight: 820; }
+      .recording-refresh:hover { background: var(--panel-2); }
+      .recording-list { display: grid; gap: 0.55rem; }
+      .recording-card { border: 1px solid var(--line); border-radius: 0.75rem; background: var(--panel); color: var(--text); padding: 0.75rem 0.85rem; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 1rem; }
+      .recording-card strong, .recording-card span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .recording-meta { margin-top: 0.22rem; color: var(--muted); font-size: 0.82rem; }
+      .recording-actions { display: flex; align-items: center; gap: 0.5rem; }
+      .recording-action { border: 1px solid var(--line); border-radius: 999px; color: var(--text); background: var(--rail-2); padding: 0.42rem 0.62rem; font-weight: 850; display: inline-flex; align-items: center; gap: 0.38rem; white-space: nowrap; }
+      .recording-action svg { width: 0.95rem; height: 0.95rem; }
+      .recording-action:hover { background: rgba(255,47,125,0.18); }
+      .recording-badge { border-radius: 999px; background: rgba(255,255,255,0.1); color: var(--text); padding: 0.28rem 0.52rem; font-size: 0.73rem; font-weight: 850; text-transform: capitalize; white-space: nowrap; }
+      .recording-badge.recording { background: rgba(255,47,125,0.22); color: #ffd7e5; }
+      .recording-badge.completed { background: rgba(35,101,74,0.42); color: #d4ffe9; }
+      .recording-badge.upcoming { background: rgba(74,54,110,0.5); color: #eee4ff; }
+      .recording-badge.interrupted, .recording-badge.failed { background: rgba(99,40,35,0.5); color: #ffe0dc; }
+      .settings-list { display: grid; gap: 0.55rem; }
+      .settings-list label { display: flex; align-items: center; justify-content: space-between; gap: 1rem; background: var(--panel); border-radius: 0.65rem; padding: 0.7rem; }
+      .empty { color: var(--muted); padding: 1rem 0; }
+      .hide { display: none !important; }
+      @media (max-width: 900px) {
+        body { overflow: auto; }
+        .shell { display: block; height: auto; }
+        .rail { min-height: auto; border-right: 0; border-bottom: 1px solid var(--line); }
+        .topbar { position: static; }
+        .search { min-width: 0; width: 100%; }
+        .guide-tools { flex-wrap: wrap; }
+        .guide-tools .select, .guide-tools .search { flex: 1 1 100%; min-width: 0; margin-left: 0; }
+        .guide-tools .refresh-button { order: 3; }
+        .player-view { grid-template-columns: 1fr; }
+        .shell.is-player { display: block; }
+        .shell.is-player .rail { display: none; }
+        .playback-shell { min-height: min(100vh, calc(100vw * 9 / 16)); }
+        .playback-stage { width: 100%; max-height: none; }
+        .player-meta { max-width: calc(100vw - 2rem); }
+        .timeline { grid-template-columns: 3.4rem minmax(0,1fr); }
+        .timeline span:last-child { display: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="shell">
+      <aside class="rail">
+        <div class="brand">
+          <a class="back" href="/" aria-label="Back to Silo"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M15.75 19.5 8.25 12l7.5-7.5"/></svg></a>
+          <h1>Live TV</h1>
+        </div>
+        <nav class="nav" aria-label="Dispatcharr views">
+          <button class="active" data-view="home"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M3.75 10.75 12 4l8.25 6.75M6.25 9.25v9.5h11.5v-9.5M9.75 18.75v-5h4.5v5"/></svg><span>Home</span></button>
+          <button data-view="favorites"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M21 8.25c0 6.25-9 11.25-9 11.25s-9-5-9-11.25A4.75 4.75 0 0 1 11.25 5 4.75 4.75 0 0 1 21 8.25Z"/></svg><span>Favorites</span> <small id="favorite-count">0</small></button>
+          <button data-view="guide"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M4.5 6.75h15M4.5 12h15M4.5 17.25h15M8.25 4.5v15M15.75 4.5v15"/></svg><span>TV Guide</span></button>
+          <button data-view="recordings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12 20.25a8.25 8.25 0 1 0 0-16.5 8.25 8.25 0 0 0 0 16.5Zm0-4a4.25 4.25 0 1 1 0-8.5 4.25 4.25 0 0 1 0 8.5Z"/></svg><span>Recordings</span></button>
+          <button data-view="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M12 8.25a3.75 3.75 0 1 1 0 7.5 3.75 3.75 0 0 1 0-7.5Z"/><path stroke-linecap="round" stroke-linejoin="round" d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 8.92 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.23.64.84 1 1.51 1H21a2 2 0 0 1 0 4h-.09A1.65 1.65 0 0 0 19.4 15Z"/></svg><span>Settings</span></button>
+        </nav>
+      </aside>
+      <main class="main">
+        <div class="topbar">
+          <button id="guide-refresh" class="refresh-button" type="button" data-guide-refresh="true" aria-label="Refresh guide" title="Refresh guide">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" aria-hidden="true"><path stroke-linecap="round" stroke-linejoin="round" d="M20 12a8 8 0 0 1-14.1 5.15M4 12A8 8 0 0 1 18.1 6.85"/><path stroke-linecap="round" stroke-linejoin="round" d="M6 17.25H3.75V19.5M18 6.75h2.25V4.5"/></svg>
+          </button>
+          <input id="global-search" class="search" placeholder="Search by program or channel">
+        </div>
+        <div id="view"></div>
+      </main>
+    </div>
+    <script>
+      const path = window.location.pathname;
+      const base = path.endsWith("/dispatcharr/player") ? path.slice(0, -"/dispatcharr/player".length) : (path.endsWith("/dispatcharr") ? path.slice(0, -"/dispatcharr".length) : "");
+      const prefsKey = "silo.attmonk.dispatcharr.preferences.v1";
+      const pluginInstallationID = (base.match(/\/api\/v1\/plugins\/(\d+)/) || [])[1] || "";
+      const state = { app: null, view: "home", category: "", query: "", hls: null, tsPlayer: null, currentChannel: null, currentSession: null, heartbeat: null, muted: false, volume: 1, volumeMenuOpen: false, audioMenuOpen: false, moreMenuOpen: false, playerGuideOpen: false, selectedAudioTrack: 0, selectedTextTrack: -1, aspectMode: "fill", playerChromeIdle: false, playerChromeTimer: null, playerWaiting: false, recordings: null, recordingsLoading: false, guideChannels: [], guideRendered: 0, guideLoading: false, refreshing: false };
+
+      function route(url) { return base + url; }
+      function byId(id) { return document.getElementById(id); }
+      function items(value) { return Array.isArray(value) ? value : []; }
+      function lower(value) { return String(value || "").toLowerCase(); }
+      function uniqueIDs(values) {
+        const seen = {};
+        const result = [];
+        items(values).forEach(function(value) {
+          value = String(value || "");
+          if (!value || seen[value]) return;
+          seen[value] = true;
+          result.push(value);
+        });
+        return result;
+      }
+      function escapeHTML(value) {
+        return String(value || "").replace(/[&<>"']/g, function(ch) {
+          return ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[ch];
+        });
+      }
+      function icon(name) {
+        const icons = {
+          "arrow-left": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M15.75 19.5 8.25 12l7.5-7.5'/></svg>",
+          "chevron-down": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='m6 9 6 6 6-6'/></svg>",
+          "ellipsis": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M6.75 12a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm6 0a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Zm6 0a.75.75 0 1 1-1.5 0 .75.75 0 0 1 1.5 0Z'/></svg>",
+          "play": "<svg viewBox='0 0 24 24' fill='currentColor' aria-hidden='true'><path d='M8 5.6v12.8c0 .55.6.9 1.08.62l10.1-6.4a.73.73 0 0 0 0-1.24L9.08 4.98A.72.72 0 0 0 8 5.6Z'/></svg>",
+          "record": "<svg viewBox='0 0 24 24' fill='currentColor' aria-hidden='true'><path d='M12 20.25a8.25 8.25 0 1 0 0-16.5 8.25 8.25 0 0 0 0 16.5Zm0-4a4.25 4.25 0 1 1 0-8.5 4.25 4.25 0 0 1 0 8.5Z'/></svg>",
+          "pause": "<svg viewBox='0 0 24 24' fill='currentColor' aria-hidden='true'><path d='M7.25 5.25h3.25v13.5H7.25zM13.5 5.25h3.25v13.5H13.5z'/></svg>",
+          "loader": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' d='M12 3a9 9 0 1 1-8.3 5.5'/></svg>",
+          "speaker": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M19.1 8.9a7 7 0 0 1 0 6.2M16.2 10.9a3 3 0 0 1 0 2.2M4.5 14.25h3l4.25 3.25V6.5L7.5 9.75h-3v4.5Z'/></svg>",
+          "speaker-off": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='m4.5 4.5 15 15M5 14.25h2.5l4.25 3.25v-5.75M11.75 8.7V6.5L8.8 8.75M16 10.8a3 3 0 0 1 .2 2.2'/></svg>",
+          "airplay": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M6.75 17.25h-1.5A2.25 2.25 0 0 1 3 15V6.75A2.25 2.25 0 0 1 5.25 4.5h13.5A2.25 2.25 0 0 1 21 6.75V15a2.25 2.25 0 0 1-2.25 2.25h-1.5M8.25 21h7.5L12 16.5 8.25 21Z'/></svg>",
+          "guide": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M4.5 6.75h15M4.5 12h15M4.5 17.25h15M8.25 4.5v15M15.75 4.5v15'/></svg>",
+          "fullscreen": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M8.25 4.5H4.5v3.75M15.75 4.5h3.75v3.75M19.5 15.75v3.75h-3.75M4.5 15.75v3.75h3.75M9 9 4.5 4.5M15 9l4.5-4.5M15 15l4.5 4.5M9 15l-4.5 4.5'/></svg>",
+          "fullscreen-exit": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M4.5 9h4.25V4.75M15.25 4.75V9h4.25M19.5 15h-4.25v4.25M8.75 19.25V15H4.5M8.75 9 4.5 4.75M15.25 9l4.25-4.25M15.25 15l4.25 4.25M8.75 15 4.5 19.25'/></svg>",
+          "heart": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M21 8.25c0 6.25-9 11.25-9 11.25s-9-5-9-11.25A4.75 4.75 0 0 1 11.25 5 4.75 4.75 0 0 1 21 8.25Z'/></svg>",
+          "heart-solid": "<svg viewBox='0 0 24 24' fill='currentColor' aria-hidden='true'><path d='M12 21s-9-5.1-9-12.25A5.45 5.45 0 0 1 12 4.7a5.45 5.45 0 0 1 9 4.05C21 15.9 12 21 12 21Z'/></svg>",
+          "pip": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M4.5 6.75A2.25 2.25 0 0 1 6.75 4.5h10.5a2.25 2.25 0 0 1 2.25 2.25v10.5a2.25 2.25 0 0 1-2.25 2.25H6.75a2.25 2.25 0 0 1-2.25-2.25V6.75Z'/><path stroke-linecap='round' stroke-linejoin='round' d='M13.25 13.25h4.25v3.25h-4.25z'/></svg>",
+          "captions": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M4.5 7.5A2.5 2.5 0 0 1 7 5h10a2.5 2.5 0 0 1 2.5 2.5v9A2.5 2.5 0 0 1 17 19H7a2.5 2.5 0 0 1-2.5-2.5v-9Z'/><path stroke-linecap='round' stroke-linejoin='round' d='M8.25 10.5h3M8.25 14h2.25M13.5 14h2.25'/></svg>",
+          "language": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M12 21a9 9 0 1 0 0-18 9 9 0 0 0 0 18Z'/><path stroke-linecap='round' stroke-linejoin='round' d='M3.75 9h16.5M3.75 15h16.5M12 3c2.25 2.35 3.25 5.25 3.25 9S14.25 18.65 12 21c-2.25-2.35-3.25-5.25-3.25-9S9.75 5.35 12 3Z'/></svg>",
+          "aspect": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M4.5 7.25A2.75 2.75 0 0 1 7.25 4.5h9.5a2.75 2.75 0 0 1 2.75 2.75v9.5a2.75 2.75 0 0 1-2.75 2.75h-9.5a2.75 2.75 0 0 1-2.75-2.75v-9.5Z'/><path stroke-linecap='round' stroke-linejoin='round' d='M8 8h3M8 8v3M16 16h-3M16 16v-3'/></svg>",
+          "search": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='m20 20-4.5-4.5M10.5 18a7.5 7.5 0 1 1 0-15 7.5 7.5 0 0 1 0 15Z'/></svg>",
+          "copy": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M8 8h9.25A1.75 1.75 0 0 1 19 9.75v9.5A1.75 1.75 0 0 1 17.25 21h-9.5A1.75 1.75 0 0 1 6 19.25V10'/><path stroke-linecap='round' stroke-linejoin='round' d='M5.75 16H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v.75'/></svg>",
+          "external": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M13.5 4.5H19.5V10.5M19.25 4.75 11 13M10.5 6H6.75A2.25 2.25 0 0 0 4.5 8.25v9A2.25 2.25 0 0 0 6.75 19.5h9A2.25 2.25 0 0 0 18 17.25V13.5'/></svg>",
+          "x": "<svg viewBox='0 0 24 24' fill='none' stroke='currentColor' aria-hidden='true'><path stroke-linecap='round' stroke-linejoin='round' d='M6 6l12 12M18 6 6 18'/></svg>"
+        };
+        return icons[name] || "";
+      }
+      function menuIcon(name) { return "<span class=\"menu-icon\">" + icon(name) + "</span>"; }
+      function defaultPrefs() {
+        return { favorites: {}, autoFavorites: {}, hiddenCategories: {}, recentChannels: [], continueWatching: {}, playback: { backendProxySupported: false, streamMode: "redirect", outputFormat: "ts" } };
+      }
+      function prefs() { return state.app && state.app.preferences ? state.app.preferences : defaultPrefs(); }
+      function favoriteMap() { return prefs().favorites || {}; }
+      function autoFavoriteMap() { return prefs().autoFavorites || {}; }
+      function hiddenMap() { return prefs().hiddenCategories || {}; }
+      function mergePrefs(remote, local) {
+        remote = Object.assign(defaultPrefs(), remote || {});
+        local = Object.assign(defaultPrefs(), local || {});
+        return {
+          favorites: Object.assign({}, remote.favorites, local.favorites),
+          autoFavorites: Object.assign({}, remote.autoFavorites, local.autoFavorites),
+          hiddenCategories: Object.assign({}, remote.hiddenCategories, local.hiddenCategories),
+          recentChannels: uniqueIDs(items(remote.recentChannels).concat(items(local.recentChannels))).slice(0, 24),
+          continueWatching: Object.assign({}, remote.continueWatching, local.continueWatching),
+          playback: Object.assign({}, remote.playback, local.playback)
+        };
+      }
+      function normalizePreferences() {
+        if (!state.app || !state.app.preferences) return;
+        const valid = {};
+        items(state.app.channels).forEach(function(channel) { valid[channel.id] = true; });
+        const recent = uniqueIDs(items(state.app.preferences.recentChannels).filter(function(id) { return !!valid[id]; }));
+        const watched = Object.keys(state.app.preferences.continueWatching || {}).sort(function(left, right) {
+          const leftPlayed = Number((state.app.preferences.continueWatching[left] || {}).playedAt || 0);
+          const rightPlayed = Number((state.app.preferences.continueWatching[right] || {}).playedAt || 0);
+          return rightPlayed - leftPlayed;
+        }).filter(function(id) { return !!valid[id]; });
+        state.app.preferences.recentChannels = uniqueIDs(recent.concat(watched)).slice(0, 24);
+      }
+      function recordWatchPreference(channel) {
+        if (!state.app || !state.app.preferences || !channel) return;
+        const id = String(channel.id || "");
+        if (!id) return;
+        const now = Math.floor(Date.now() / 1000);
+        const existing = state.app.preferences.continueWatching[id] || {};
+        const plays = Number(existing.plays || 0) + 1;
+        state.app.preferences.recentChannels = uniqueIDs([id].concat(items(state.app.preferences.recentChannels))).slice(0, 24);
+        state.app.preferences.continueWatching[id] = {
+          itemKind: "channel",
+          itemId: id,
+          itemName: channel.name || id,
+          playedAt: now,
+          plays: plays
+        };
+        if (plays >= 3 && !favoriteMap()[id]) state.app.preferences.autoFavorites[id] = true;
+        normalizePreferences();
+        savePrefs();
+      }
+      function readLocalPrefs() {
+        try { return Object.assign(defaultPrefs(), JSON.parse(localStorage.getItem(prefsKey) || "{}")); }
+        catch (_) { return defaultPrefs(); }
+      }
+      function readSiloPrefsValue(value) {
+        if (!value) return null;
+        try { return Object.assign(defaultPrefs(), JSON.parse(value)); }
+        catch (_) { return null; }
+      }
+      async function loadUserPrefs() {
+        if (!pluginInstallationID) return null;
+        const payload = await coreGetJSON("/api/v1/settings/plugins/" + encodeURIComponent(pluginInstallationID));
+        return readSiloPrefsValue(payload && payload.values ? payload.values.preferences : "");
+      }
+      function writeLocalPrefs() {
+        try { localStorage.setItem(prefsKey, JSON.stringify(state.app.preferences)); } catch (_) {}
+      }
+      function savePrefs() {
+        if (!state.app || !state.app.preferences) return;
+        writeLocalPrefs();
+        if (pluginInstallationID) {
+          corePutNoContent("/api/v1/settings/plugins/" + encodeURIComponent(pluginInstallationID), { values: { preferences: JSON.stringify(state.app.preferences) } }).catch(function() {});
+        }
+        postJSON("/dispatcharr/api/preferences", state.app.preferences).catch(function() {});
+      }
+      async function getJSON(url) {
+        const response = await fetch(route(url), { credentials: "include" });
+        if (!response.ok) throw new Error("request failed");
+        return response.json();
+      }
+      async function postJSON(url, body) {
+        const response = await fetch(route(url), { method: "POST", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+        if (!response.ok) throw new Error("request failed");
+        return response.json();
+      }
+      async function coreGetJSON(url) {
+        const response = await fetch(url, { credentials: "include" });
+        if (!response.ok) throw new Error("request failed");
+        return response.json();
+      }
+      async function corePutNoContent(url, body) {
+        const response = await fetch(url, { method: "PUT", credentials: "include", headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+        if (!response.ok) throw new Error("request failed");
+      }
+      function channelByID(id) {
+        return items(state.app.channels).find(function(channel) { return channel.id === id; }) || null;
+      }
+      function visibleChannels(ignoreQuery) {
+        const hidden = hiddenMap();
+        return items(state.app.channels).filter(function(channel) {
+          if (channel.categoryId && hidden[channel.categoryId]) return false;
+          if (state.view !== "favorites" && state.category && channel.categoryId !== state.category) return false;
+          if (!ignoreQuery && state.query && !channelMatchesQuery(channel)) return false;
+          if (state.view === "favorites" && !favoriteMap()[channel.id] && !autoFavoriteMap()[channel.id]) return false;
+          return true;
+        });
+      }
+      function channelMatchesQuery(channel) {
+        if (!state.query) return true;
+        return lower([channel.name, channel.categoryName, channel.number].join(" ")).indexOf(lower(state.query)) !== -1;
+      }
+      function programMatchesQuery(program) {
+        if (!state.query) return true;
+        return lower([program.title, program.description].join(" ")).indexOf(lower(state.query)) !== -1;
+      }
+      function guideChannelMatchesQuery(channel) {
+        if (!state.query || channelMatchesQuery(channel)) return true;
+        return programsFor(channel.id).some(programMatchesQuery);
+      }
+      function programsFor(channelID) {
+        const now = Math.floor(Date.now() / 1000);
+        return items(state.app.programs).filter(function(program) {
+          return (!channelID || program.channelId === channelID) && (!program.endUnix || program.endUnix >= now - 3600);
+        }).sort(function(a, b) { return (a.startUnix || 0) - (b.startUnix || 0); });
+      }
+      function timeLabel(unix) {
+        if (!unix) return "";
+        return new Date(unix * 1000).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+      }
+      function guideSlotStart() {
+        const now = Math.floor(Date.now() / 1000);
+        return Math.floor((now - 3600) / 1800) * 1800;
+      }
+      function guideSlots() {
+        const start = guideSlotStart();
+        const slots = [];
+        for (let index = 0; index < 50; index++) slots.push(start + index * 1800);
+        return slots;
+      }
+      function guideTimelineStyle(slots) {
+        return "--epg-slots: " + slots.length + "; --epg-width: " + (slots.length * 12) + "rem;";
+      }
+      function guideWindow() {
+        const start = guideSlotStart();
+        return { start: start, end: start + (25 * 3600), slotCount: 50 };
+      }
+      function epgCellStyle(startUnix, endUnix, windowInfo) {
+        const duration = windowInfo.end - windowInfo.start;
+        const start = Math.max(startUnix || windowInfo.start, windowInfo.start);
+        const end = Math.min(endUnix || start + 1800, windowInfo.end);
+        const left = ((start - windowInfo.start) / duration) * 100;
+        const width = Math.max(((end - start) / duration) * 100, 100 / windowInfo.slotCount * 0.66);
+        return "left: " + left.toFixed(4) + "%; width: calc(" + width.toFixed(4) + "% - 0.25rem);";
+      }
+      function stopPlayback() {
+        const video = byId("player");
+        if (state.hls) { state.hls.destroy(); state.hls = null; }
+        if (state.tsPlayer) { state.tsPlayer.destroy(); state.tsPlayer = null; }
+        if (state.playerChromeTimer) {
+          clearTimeout(state.playerChromeTimer);
+          state.playerChromeTimer = null;
+        }
+        state.playerChromeIdle = false;
+        if (video) {
+          video.pause();
+          video.removeAttribute("src");
+          video.load();
+        }
+      }
+      function stopCurrentWatch(reason) {
+        if (!state.currentSession) return;
+        postJSON("/dispatcharr/api/watch/stop", { sessionId: state.currentSession.id, reason: reason || "stop" }).catch(function() {});
+        state.currentSession = null;
+        if (state.heartbeat) {
+          clearInterval(state.heartbeat);
+          state.heartbeat = null;
+        }
+      }
+      function setView(view) {
+        if (view !== "player") {
+          stopPlayback();
+          if (state.view === "player") stopCurrentWatch("leave_player");
+        }
+        state.view = view;
+        if (view === "favorites") state.category = "";
+        render();
+      }
+      function setCategory(id) {
+        state.category = id || "";
+        state.view = id ? "live" : "home";
+        render();
+      }
+      async function hydrateApp(payload) {
+        state.app = payload;
+        const siloPrefs = await loadUserPrefs().catch(function() { return null; });
+        const localPrefs = readLocalPrefs();
+        state.app.preferences = siloPrefs ? mergePrefs(siloPrefs, {}) : mergePrefs(state.app.preferences, localPrefs);
+        state.app.programs = items(state.app.programs);
+        normalizePreferences();
+        savePrefs();
+      }
+      async function loadApp() {
+        await hydrateApp(await getJSON("/dispatcharr/api/app"));
+        render();
+      }
+      async function refreshAppData() {
+        if (state.refreshing) return;
+        const buttons = Array.prototype.slice.call(document.querySelectorAll("[data-guide-refresh]"));
+        state.refreshing = true;
+        buttons.forEach(function(button) {
+          button.classList.add("is-loading");
+          button.disabled = true;
+        });
+        try {
+          await hydrateApp(await postJSON("/dispatcharr/api/refresh", {}));
+          state.recordings = null;
+          render();
+          showAppToast("Guide refreshed from Dispatcharr.");
+        } catch (error) {
+          showAppToast("Dispatcharr refresh failed.");
+        } finally {
+          state.refreshing = false;
+          buttons.forEach(function(button) {
+            button.classList.remove("is-loading");
+            button.disabled = false;
+          });
+        }
+      }
+      function renderRail() {
+        document.querySelectorAll(".nav button").forEach(function(button) {
+          button.classList.toggle("active", button.dataset.view === state.view);
+        });
+        byId("favorite-count").textContent = Object.keys(favoriteMap()).length + Object.keys(autoFavoriteMap()).length;
+      }
+      function logoHTML(channel) {
+        if (channel.logoUrl) return "<img class=\"logo\" src=\"" + escapeHTML(channel.logoUrl) + "\" alt=\"\">";
+        return "<div class=\"logo\" aria-hidden=\"true\"></div>";
+      }
+      function render() {
+        if (!state.app) return;
+        document.querySelector(".shell").classList.toggle("is-player", state.view === "player");
+        document.querySelector(".shell").classList.toggle("is-guide", state.view === "guide");
+        renderRail();
+        if (state.view === "guide") renderGuidePage();
+        else if (state.view === "player") renderPlayerPage();
+        else if (state.view === "live" || state.view === "favorites") renderLivePage();
+        else if (state.view === "recordings") renderRecordingsPage();
+        else if (state.view === "settings") renderSettings();
+        else renderHome();
+      }
+      function renderHome() {
+        const root = byId("view");
+        const recent = recentChannels(6);
+        root.innerHTML = sectionHeader("Continue watching") + rowCards(recent.length ? recent : visibleChannels(false).slice(0, 6)) + sectionHeader("TV Guide") + renderHomeGuide(recent.slice(0, 5)) + sectionHeader("Categories") + categoryGrid();
+      }
+      function sectionHeader(title) {
+        return "<div class=\"section-title\"><span>" + escapeHTML(title) + "</span></div>";
+      }
+      function rowCards(channels) {
+        if (!channels.length) return "<div class=\"empty\">No channels yet.</div>";
+        return "<div class=\"row-scroll\">" + channels.map(function(channel) {
+          return "<button class=\"continue-card\" data-channel=\"" + escapeHTML(channel.id) + "\"><div class=\"poster-box\">" + (channel.logoUrl ? "<img src=\"" + escapeHTML(channel.logoUrl) + "\" alt=\"\">" : "<span>" + escapeHTML((channel.name || "TV").slice(0, 5)) + "</span>") + "</div><div class=\"progress\"><i></i></div><strong>" + escapeHTML(channel.name || "Untitled") + "</strong><div class=\"muted\">" + escapeHTML(channel.categoryName || "Live TV") + "</div></button>";
+        }).join("") + "</div>";
+      }
+      function categoryGrid() {
+        const hidden = hiddenMap();
+        const categories = categoriesWithChannels(function(channel) {
+          return !(channel.categoryId && hidden[channel.categoryId]);
+        });
+        if (!categories.length) return "<div class=\"empty\">No categories yet.</div>";
+        return "<div class=\"category-grid\">" + categories.map(function(category) {
+          return "<button class=\"tile" + (state.category === category.id ? " active" : "") + "\" data-category=\"" + escapeHTML(category.id) + "\"><strong>" + escapeHTML(category.name || category.id) + "</strong></button>";
+        }).join("") + "</div>";
+      }
+      function categoriesWithChannels(includeChannel) {
+        const categoryCounts = {};
+        items(state.app.channels).forEach(function(channel) {
+          if (includeChannel && !includeChannel(channel)) return;
+          if (channel.categoryId) categoryCounts[channel.categoryId] = (categoryCounts[channel.categoryId] || 0) + 1;
+        });
+        return items(state.app.categories).filter(function(category) {
+          return !!categoryCounts[category.id];
+        });
+      }
+      function recentChannels(limit) {
+        const seen = {};
+        const channels = [];
+        items(prefs().recentChannels).forEach(function(id) {
+          if (seen[id]) return;
+          const channel = channelByID(id);
+          if (!channel) return;
+          seen[id] = true;
+          channels.push(channel);
+        });
+        return channels.slice(0, limit || channels.length);
+      }
+      function renderHomeGuide(channels) {
+        if (!channels.length) return "<div class=\"empty\">No recently watched channels yet.</div>";
+        const slots = guideSlots();
+        return "<div class=\"home-guide guide-scroll\"><div class=\"guide-page guide-timeline\" style=\"" + guideTimelineStyle(slots) + "\"><div class=\"time-head\"><span>Today</span>" + slots.map(function(slot) { return "<span>" + escapeHTML(timeLabel(slot)) + "</span>"; }).join("") + "</div>" + channels.map(function(channel, channelIndex) {
+          return "<div class=\"epg-row\"><button class=\"epg-channel\" data-channel=\"" + escapeHTML(channel.id) + "\" aria-label=\"" + escapeHTML(channel.name || "Untitled") + "\">" + logoHTML(channel) + "</button><div class=\"epg-programs\">" + renderEPGCells(channel, channelIndex) + "</div></div>";
+        }).join("") + "</div></div>";
+      }
+      function renderLivePage() {
+        const channels = visibleChannels(false);
+        byId("view").innerHTML = state.view === "favorites"
+          ? sectionHeader("Favorite channels") + rowCards(channels.slice(0, 60))
+          : sectionHeader("Categories") + categoryGrid() + sectionHeader("Channels") + rowCards(channels.slice(0, 24));
+      }
+      function recordingCustom(recording) {
+        return recording && recording.custom_properties && typeof recording.custom_properties === "object" ? recording.custom_properties : {};
+      }
+      function recordingProgram(recording) {
+        const custom = recordingCustom(recording);
+        return custom.program && typeof custom.program === "object" ? custom.program : {};
+      }
+      function recordingStatus(recording) {
+        const custom = recordingCustom(recording);
+        const now = Date.now();
+        const start = Date.parse(recording.start_time || custom.start_time || "");
+        const end = Date.parse(recording.end_time || custom.end_time || "");
+        if (custom.status) return String(custom.status);
+        if (!Number.isNaN(start) && start > now) return "upcoming";
+        if (!Number.isNaN(start) && !Number.isNaN(end) && start <= now && end >= now) return "recording";
+        return "completed";
+      }
+      function recordingTitle(recording) {
+        const custom = recordingCustom(recording);
+        const program = recordingProgram(recording);
+        return custom.title || program.title || custom.file_name || "Untitled recording";
+      }
+      function recordingChannelName(recording) {
+        const custom = recordingCustom(recording);
+        const program = recordingProgram(recording);
+        return custom.channel_name || program.channel || program.channel_name || "Dispatcharr";
+      }
+      function recordingTimeLabel(value) {
+        const date = new Date(value || "");
+        if (Number.isNaN(date.getTime())) return "";
+        return date.toLocaleString([], { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+      }
+      function recordingWindow(recording) {
+        const start = recordingTimeLabel(recording.start_time);
+        const end = recordingTimeLabel(recording.end_time);
+        if (start && end) return start + " - " + end;
+        return start || end || "Time unavailable";
+      }
+      function normalizeRecordings(payload) {
+        if (!payload || !payload.available) return [];
+        return items(payload.items).slice().sort(function(a, b) {
+          const aTime = Date.parse(a.start_time || "");
+          const bTime = Date.parse(b.start_time || "");
+          return (Number.isNaN(bTime) ? 0 : bTime) - (Number.isNaN(aTime) ? 0 : aTime);
+        });
+      }
+      function recordingPlaybackURL(recording) {
+        const silo = recording && recording._silo ? recording._silo : {};
+        return silo.playback_url || "";
+      }
+      function recordingMatchesQuery(recording) {
+        if (!state.query) return true;
+        const haystack = [recordingTitle(recording), recordingChannelName(recording), recordingStatus(recording)].join(" ").toLowerCase();
+        return haystack.indexOf(lower(state.query)) !== -1;
+      }
+      function renderRecordingCard(recording) {
+        const status = recordingStatus(recording).toLowerCase();
+        const playbackURL = recordingPlaybackURL(recording);
+        const action = playbackURL ? "<button class=\"recording-action\" data-recording-playback=\"" + escapeHTML(playbackURL) + "\">" + icon("play") + "<span>Playback</span></button>" : "";
+        return "<div class=\"recording-card\"><span><strong>" + escapeHTML(recordingTitle(recording)) + "</strong><span class=\"recording-meta\">" + escapeHTML(recordingChannelName(recording) + " - " + recordingWindow(recording)) + "</span></span><div class=\"recording-actions\">" + action + "<span class=\"recording-badge " + escapeHTML(status) + "\">" + escapeHTML(status.split("_").join(" ")) + "</span></div></div>";
+      }
+      function renderRecordingSection(title, recordings) {
+        if (!recordings.length) return "";
+        return sectionHeader(title) + "<div class=\"recording-list\">" + recordings.map(renderRecordingCard).join("") + "</div>";
+      }
+      function loadRecordings(force) {
+        if (state.recordingsLoading || (state.recordings && !force)) return;
+        state.recordingsLoading = true;
+        getJSON("/dispatcharr/api/recordings").then(function(payload) {
+          state.recordings = payload;
+        }).catch(function(error) {
+          state.recordings = { available: false, reason: "Unable to load Dispatcharr recordings.", items: [] };
+        }).finally(function() {
+          state.recordingsLoading = false;
+          if (state.view === "recordings") render();
+        });
+      }
+      function programByID(channelID, programID) {
+        return programsFor(channelID).find(function(program) { return String(program.id || "") === String(programID || ""); }) || null;
+      }
+      function scheduleProgram(channelID, programID, button) {
+        const channel = channelByID(channelID);
+        const program = programByID(channelID, programID);
+        if (!channel || !program) {
+          showAppToast("Could not find that guide entry.");
+          return;
+        }
+        if (button) button.disabled = true;
+        postJSON("/dispatcharr/api/recordings", {
+          channelId: channel.id,
+          programId: program.id || "",
+          title: program.title || channel.name || "Recording",
+          description: program.description || "",
+          startUnix: program.startUnix || 0,
+          endUnix: program.endUnix || 0
+        }).then(function() {
+          state.recordings = null;
+          loadRecordings(true);
+          showAppToast("Recording scheduled in Dispatcharr.");
+        }).catch(function() {
+          showAppToast("Dispatcharr could not schedule that recording.");
+        }).finally(function() {
+          if (button) button.disabled = false;
+        });
+      }
+      function renderRecordingsPage() {
+        const root = byId("view");
+        if (!state.recordings) {
+          root.innerHTML = sectionHeader("Recordings") + "<div class=\"empty\">Loading Dispatcharr recordings...</div>";
+          loadRecordings(false);
+          return;
+        }
+        const toolbar = "<div class=\"recording-toolbar\"><button class=\"recording-refresh\" data-recordings-refresh=\"true\">Refresh recordings</button></div>";
+        if (!state.recordings.available) {
+          root.innerHTML = toolbar + sectionHeader("Recordings") + "<div class=\"empty\">" + escapeHTML(state.recordings.reason || "Recordings are not available for this connection mode.") + "</div>";
+          return;
+        }
+        const recordings = normalizeRecordings(state.recordings).filter(recordingMatchesQuery);
+        const active = recordings.filter(function(recording) { return recordingStatus(recording).toLowerCase() === "recording"; });
+        const upcoming = recordings.filter(function(recording) { return recordingStatus(recording).toLowerCase() === "upcoming"; });
+        const completed = recordings.filter(function(recording) {
+          const status = recordingStatus(recording).toLowerCase();
+          return status !== "recording" && status !== "upcoming";
+        });
+        root.innerHTML = toolbar
+          + renderRecordingSection("Recording now", active)
+          + renderRecordingSection("Upcoming", upcoming)
+          + renderRecordingSection("Completed", completed.slice(0, 80))
+          + (!recordings.length ? "<div class=\"empty\">No Dispatcharr recordings found.</div>" : "");
+      }
+      function currentProgram(channel) {
+        if (!channel) return null;
+        const now = Math.floor(Date.now() / 1000);
+        return programsFor(channel.id).find(function(program) {
+          return (!program.startUnix || program.startUnix <= now + 600) && (!program.endUnix || program.endUnix >= now);
+        }) || programsFor(channel.id)[0] || null;
+      }
+      function playerLogoHTML(channel) {
+        if (channel && channel.logoUrl) return "<img class=\"player-logo\" src=\"" + escapeHTML(channel.logoUrl) + "\" alt=\"\">";
+        return "<div class=\"player-logo player-logo-fallback\">" + escapeHTML(((channel && channel.name) || "TV").slice(0, 5)) + "</div>";
+      }
+      function playerFavoriteButtonHTML(channel) {
+        const isFavorite = !!(channel && favoriteMap()[channel.id]);
+        return "<button id=\"player-favorite-button\" class=\"player-icon favorite" + (isFavorite ? " active" : "") + "\" data-player-action=\"favorite\" aria-label=\"" + (isFavorite ? "Remove channel from favorites" : "Favorite channel") + "\" aria-pressed=\"" + (isFavorite ? "true" : "false") + "\">" + icon(isFavorite ? "heart-solid" : "heart") + "</button>";
+      }
+      function renderPlayerPage() {
+        const channel = state.currentChannel || visibleChannels(false)[0] || null;
+        const program = currentProgram(channel) || {};
+        const channelName = channel ? channel.name || "Untitled channel" : "Choose a channel";
+        const categoryNameText = channel ? channel.categoryName || "Live TV" : "Live TV";
+        const title = program.title || channelName;
+        const description = program.description || categoryNameText;
+        const start = timeLabel(program.startUnix) || "LIVE";
+        const end = timeLabel(program.endUnix) || "Now";
+        byId("view").innerHTML = "<section class=\"playback-shell\"><div class=\"playback-stage\"><video id=\"player\" class=\"playback-video\" autoplay playsinline></video><div class=\"playback-scrim\"></div><button id=\"player-center-button\" class=\"player-center-button hidden\" data-player-action=\"play-toggle\" aria-label=\"Play\">" + icon("play") + "</button><div class=\"player-top\"><button class=\"player-exit\" data-player-action=\"back\" aria-label=\"Back to Live TV browse\"><span class=\"player-icon\">" + icon("x") + "</span><span>Exit</span></button><div class=\"player-top-actions\"><div class=\"player-audio\"><button id=\"player-audio-button\" class=\"player-chip\" data-player-action=\"audio-menu\" aria-haspopup=\"true\" aria-expanded=\"false\">" + icon("language") + "<span>Audio</span>" + icon("chevron-down") + "</button><div id=\"player-audio-menu\" class=\"player-menu\" role=\"menu\"></div></div><div class=\"player-volume\"><button id=\"player-volume-button\" class=\"player-icon\" data-player-action=\"volume-menu\" aria-label=\"Volume\" aria-haspopup=\"true\" aria-expanded=\"false\">" + icon("speaker") + "</button><div id=\"player-volume-popover\" class=\"volume-popover\"><span>VOL</span><input id=\"player-volume-slider\" type=\"range\" min=\"0\" max=\"100\" step=\"1\" value=\"" + Math.round(state.volume * 100) + "\" aria-label=\"Volume\"><span id=\"player-volume-value\" class=\"volume-value\"></span></div></div><button class=\"player-icon\" data-player-action=\"cast\" aria-label=\"AirPlay or Cast\">" + icon("airplay") + "</button><button id=\"player-guide-button\" class=\"player-icon player-guide-button\" data-player-action=\"guide\" aria-label=\"Guide\" aria-haspopup=\"true\" aria-expanded=\"false\">" + icon("guide") + "</button><button id=\"player-fullscreen-button\" class=\"player-icon\" data-player-action=\"fullscreen\" aria-label=\"Fullscreen\" aria-pressed=\"false\">" + icon("fullscreen") + "</button><div class=\"player-more\"><button id=\"player-more-button\" class=\"player-icon\" data-player-action=\"more\" aria-label=\"More\" aria-haspopup=\"true\" aria-expanded=\"false\">" + icon("ellipsis") + "</button><div id=\"player-more-menu\" class=\"player-more-menu\"></div></div></div></div><div id=\"player-toast\" class=\"player-toast\" role=\"status\"></div><div id=\"player-guide-panel\" class=\"player-guide-panel\"></div><div class=\"player-bottom\"><div class=\"player-bottom-row\"><div class=\"player-meta\">" + playerLogoHTML(channel) + "<div class=\"player-kicker\">" + escapeHTML(channelName) + "</div><h2 class=\"player-title\">" + escapeHTML(title) + "</h2><p class=\"player-description\">" + escapeHTML(description) + "</p><div class=\"player-tags\"><span class=\"player-tag\">" + escapeHTML(categoryNameText) + "</span><span class=\"player-tag\">AV</span></div></div><div class=\"player-bottom-actions\">" + playerFavoriteButtonHTML(channel) + "<button class=\"player-icon\" data-player-action=\"pip\" aria-label=\"Picture in Picture\">" + icon("pip") + "</button><button id=\"player-subtitles-button\" class=\"player-icon\" data-player-action=\"subtitles\" aria-label=\"Subtitles\" aria-pressed=\"false\">" + icon("captions") + "</button><button id=\"player-language-button\" class=\"player-icon\" data-player-action=\"language-menu\" aria-label=\"Audio language\" aria-haspopup=\"true\" aria-expanded=\"false\">" + icon("language") + "</button></div></div><div class=\"timeline\"><span>" + escapeHTML(start) + "</span><div class=\"timeline-bar\"><div class=\"timeline-fill\"></div><div class=\"timeline-knob\"></div></div><span><span class=\"live-dot\"></span>LIVE&nbsp;&nbsp;" + escapeHTML(end) + "</span></div></div></div></section>";
+        updateAudioMenu();
+        updateVolumeMenu();
+        renderPlayerGuidePanel();
+        renderPlayerMoreMenu();
+        updateFullscreenButton();
+        wakePlayerChrome(1800);
+      }
+      function hasOpenPlayerOverlay() {
+        return state.audioMenuOpen || state.volumeMenuOpen || state.moreMenuOpen || state.playerGuideOpen;
+      }
+      function updatePlayerChrome() {
+        const shell = document.querySelector(".playback-shell");
+        if (!shell) return;
+        shell.classList.toggle("is-idle", state.playerChromeIdle && !hasOpenPlayerOverlay());
+      }
+      function wakePlayerChrome(delay) {
+        if (state.view !== "player") return;
+        state.playerChromeIdle = false;
+        updatePlayerChrome();
+        if (state.playerChromeTimer) clearTimeout(state.playerChromeTimer);
+        state.playerChromeTimer = setTimeout(function() {
+          state.playerChromeIdle = true;
+          updatePlayerChrome();
+        }, delay || 2400);
+      }
+      function renderPlayerGuidePanel() {
+        const panel = byId("player-guide-panel");
+        const button = byId("player-guide-button");
+        if (!panel) return;
+        const channels = visibleChannels(true).slice(0, 42);
+        panel.classList.toggle("open", state.playerGuideOpen);
+        if (button) {
+          button.classList.toggle("active", state.playerGuideOpen);
+          button.setAttribute("aria-expanded", state.playerGuideOpen ? "true" : "false");
+        }
+        updatePlayerChrome();
+        if (!state.playerGuideOpen) return;
+        panel.innerHTML = "<div class=\"player-guide-head\"><div><strong>Channel Guide</strong><span>" + escapeHTML(categoryName(state.category) || "Live TV") + "</span></div><button class=\"player-icon\" data-player-action=\"guide-close\" aria-label=\"Close guide\">" + icon("x") + "</button></div><div class=\"player-guide-list\">" + channels.map(function(channel) {
+          const program = currentProgram(channel) || {};
+          const title = program.title || "Data not available";
+          const time = timeLabel(program.startUnix) || "Live";
+          return "<button class=\"player-guide-row" + (state.currentChannel && state.currentChannel.id === channel.id ? " active" : "") + "\" data-channel=\"" + escapeHTML(channel.id) + "\">" + logoHTML(channel) + "<span><strong>" + escapeHTML(channel.name || "Untitled") + "</strong><small>" + escapeHTML(time + " - " + title) + "</small></span></button>";
+        }).join("") + "</div>";
+      }
+      function currentStreamURL() {
+        return state.currentChannel ? route("/dispatcharr/stream?channel_id=" + encodeURIComponent(state.currentChannel.id)) : "";
+      }
+      function browserStreamURL(channel) {
+        return route("/dispatcharr/stream?channel_id=" + encodeURIComponent(channel.id) + "&output_profile=2");
+      }
+      function applyAspectMode() {
+        const video = byId("player");
+        if (video) video.style.objectFit = state.aspectMode === "fit" ? "contain" : "cover";
+      }
+      function renderPlayerMoreMenu() {
+        const button = byId("player-more-button");
+        const menu = byId("player-more-menu");
+        if (!menu) return;
+        if (button) button.setAttribute("aria-expanded", state.moreMenuOpen ? "true" : "false");
+        menu.classList.toggle("open", state.moreMenuOpen);
+        updatePlayerChrome();
+        if (!state.moreMenuOpen) return;
+        const recent = items(prefs().recentChannels).map(channelByID).filter(Boolean).filter(function(channel) {
+          return !state.currentChannel || channel.id !== state.currentChannel.id;
+        }).slice(0, 3);
+        menu.innerHTML = "<div class=\"player-more-kicker\">Video settings & controls</div>"
+          + "<button data-player-action=\"aspect\">" + menuIcon("aspect") + "<span>Aspect ratio<small>" + (state.aspectMode === "fit" ? "Fit to screen" : "Fill screen") + "</small></span></button>"
+          + "<button data-player-action=\"fullscreen\">" + menuIcon(document.fullscreenElement ? "fullscreen-exit" : "fullscreen") + "<span>Fullscreen<small>" + (document.fullscreenElement ? "Exit player fullscreen" : "Fill the display") + "</small></span></button>"
+          + "<button data-player-action=\"guide\">" + menuIcon("guide") + "<span>Channel guide<small>Browse channels without leaving playback</small></span></button>"
+          + "<button data-player-action=\"search-channel\">" + menuIcon("search") + "<span>Search channel<small>Jump to the channel list search</small></span></button>"
+          + (recent.length ? "<div class=\"player-more-separator\"></div><div class=\"player-more-kicker\">Channels history</div>" + recent.map(function(channel) { return "<button data-channel=\"" + escapeHTML(channel.id) + "\">" + logoHTML(channel) + "<span>" + escapeHTML(channel.name || "Untitled") + "<small>" + escapeHTML(channel.categoryName || "Live TV") + "</small></span></button>"; }).join("") : "")
+          + "<div class=\"player-more-separator\"></div><div class=\"player-more-kicker\">Video & audio casting</div>"
+          + "<button data-player-action=\"cast\">" + menuIcon("airplay") + "<span>AirPlay or Cast<small>Use browser playback target picker</small></span></button>"
+          + "<button data-player-action=\"copy-stream\">" + menuIcon("copy") + "<span>Copy stream URL<small>For an external player</small></span></button>"
+          + "<button data-player-action=\"open-stream\">" + menuIcon("external") + "<span>Use external video player<small>Open the stream route in a new tab</small></span></button>";
+      }
+      function renderGuidePage() {
+        const categories = items(state.app.categories);
+        const slots = guideSlots();
+        byId("view").innerHTML = "<div class=\"guide-page\"><div class=\"guide-tools\"><select id=\"category-select\" class=\"select\"><option value=\"\">All categories</option>" + categories.map(function(category) { return "<option value=\"" + escapeHTML(category.id) + "\"" + (state.category === category.id ? " selected" : "") + ">" + escapeHTML(category.name || category.id) + "</option>"; }).join("") + "</select><button id=\"guide-inline-refresh\" class=\"refresh-button\" type=\"button\" data-guide-refresh=\"true\" aria-label=\"Refresh guide\" title=\"Refresh guide\"><svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" aria-hidden=\"true\"><path stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M20 12a8 8 0 0 1-14.1 5.15M4 12A8 8 0 0 1 18.1 6.85\"/><path stroke-linecap=\"round\" stroke-linejoin=\"round\" d=\"M6 17.25H3.75V19.5M18 6.75h2.25V4.5\"/></svg></button><input id=\"guide-search\" class=\"search\" placeholder=\"Search by program or channel\" value=\"" + escapeHTML(state.query) + "\"></div><div class=\"guide-scroll\"><div class=\"guide-timeline\" style=\"" + guideTimelineStyle(slots) + "\"><div class=\"time-head\"><span>Today</span>" + slots.map(function(slot) { return "<span>" + escapeHTML(timeLabel(slot)) + "</span>"; }).join("") + "</div><div id=\"epg\"></div></div></div></div>";
+        byId("category-select").onchange = function(event) { state.category = event.target.value; renderGuidePage(); };
+        byId("guide-search").oninput = function(event) { state.query = event.target.value; resetGuideRows(); renderEPG(); };
+        resetGuideRows();
+        renderEPG();
+      }
+      function guideBatchSize() { return 40; }
+      function resetGuideRows() {
+        state.guideChannels = visibleChannels(true).filter(guideChannelMatchesQuery);
+        state.guideRendered = 0;
+        state.guideLoading = false;
+      }
+      function renderEPGCells(channel, channelIndex) {
+        const windowInfo = guideWindow();
+        const windowStart = windowInfo.start;
+        const windowEnd = windowInfo.end;
+        const now = Math.floor(Date.now() / 1000);
+        const channelMatched = channelMatchesQuery(channel);
+        const programs = programsFor(channel.id).filter(function(program) {
+          const start = program.startUnix || windowStart;
+          const end = program.endUnix || start + 1800;
+          const matchesQuery = channelMatched || programMatchesQuery(program);
+          return matchesQuery && end > windowStart && start < windowEnd;
+        });
+        if (!programs.length) {
+          return "<button class=\"epg-cell program gray\" data-channel=\"" + escapeHTML(channel.id) + "\" style=\"left: 0; width: calc(100% - 0.25rem);\"><time>" + escapeHTML(timeLabel(windowStart)) + "</time><strong>Data not available</strong></button>";
+        }
+        return programs.map(function(program, index) {
+          const canSchedule = (program.endUnix || 0) > now;
+          return "<div class=\"epg-cell program " + colorClass(index + channelIndex) + "\" style=\"" + epgCellStyle(program.startUnix, program.endUnix, windowInfo) + "\"><button class=\"epg-play\" data-channel=\"" + escapeHTML(channel.id) + "\"><time>" + escapeHTML(timeLabel(program.startUnix)) + "</time><strong>" + escapeHTML(program.title || "Data not available") + "</strong></button>" + (canSchedule ? "<button class=\"epg-schedule\" data-schedule-channel=\"" + escapeHTML(channel.id) + "\" data-schedule-program=\"" + escapeHTML(program.id || "") + "\" aria-label=\"Schedule recording\">" + icon("record") + "</button>" : "") + "</div>";
+        }).join("");
+      }
+      function renderEPGRow(channel, channelIndex) {
+        return "<div class=\"epg-row\"><button class=\"epg-channel\" data-channel=\"" + escapeHTML(channel.id) + "\" aria-label=\"" + escapeHTML(channel.name || "Untitled") + "\">" + logoHTML(channel) + "</button><div class=\"epg-programs\">" + renderEPGCells(channel, channelIndex) + "</div></div>";
+      }
+      function renderEPG() {
+        const root = byId("epg");
+        root.innerHTML = "";
+        appendGuideRows();
+      }
+      function appendGuideRows() {
+        if (state.view !== "guide" || state.guideLoading) return;
+        const root = byId("epg");
+        if (!root) return;
+        if (!state.guideChannels.length) {
+          root.innerHTML = "<div class=\"empty\">No guide matches.</div>";
+          return;
+        }
+        if (state.guideRendered >= state.guideChannels.length) return;
+        state.guideLoading = true;
+        const start = state.guideRendered;
+        const end = Math.min(start + guideBatchSize(), state.guideChannels.length);
+        const rows = state.guideChannels.slice(start, end).map(function(channel, offset) {
+          return renderEPGRow(channel, start + offset);
+        }).join("");
+        root.insertAdjacentHTML("beforeend", rows);
+        state.guideRendered = end;
+        state.guideLoading = false;
+        if (isNearGuideEnd()) appendGuideRows();
+      }
+      function isNearGuideEnd() {
+        return window.innerHeight + window.scrollY > document.documentElement.scrollHeight - 900;
+      }
+      function renderSettings() {
+        byId("view").innerHTML = "<div class=\"settings-card\"><h2>Hidden categories</h2><div id=\"settings-list\" class=\"settings-list\"></div></div>";
+        const root = byId("settings-list");
+        const categories = categoriesWithChannels();
+        root.innerHTML = categories.map(function(category) {
+          return "<label><span>" + escapeHTML(category.name || category.id) + "</span><input type=\"checkbox\" data-hide=\"" + escapeHTML(category.id) + "\"" + (hiddenMap()[category.id] ? " checked" : "") + "></label>";
+        }).join("") || "<div class=\"empty\">No categories available for this connection.</div>";
+      }
+      function categoryName(id) {
+        const category = items(state.app.categories).find(function(item) { return item.id === id; });
+        return category ? category.name : "";
+      }
+      function colorClass(index) {
+        return ["purple", "green", "red", "gray", "blue"][index % 5];
+      }
+      function audioTrackList() {
+        const video = byId("player");
+        if (!video || !video.audioTracks || typeof video.audioTracks.length !== "number") return [];
+        const tracks = [];
+        for (let index = 0; index < video.audioTracks.length; index++) tracks.push(video.audioTracks[index]);
+        return tracks;
+      }
+      function audioTrackName(track, index) {
+        return track && (track.label || track.language || track.kind || track.id) ? (track.label || track.language || track.kind || track.id) : "Audio " + (index + 1);
+      }
+      function textTrackList() {
+        const video = byId("player");
+        if (!video || !video.textTracks || typeof video.textTracks.length !== "number") return [];
+        const tracks = [];
+        for (let index = 0; index < video.textTracks.length; index++) {
+          const track = video.textTracks[index];
+          if (!track || (track.kind && ["subtitles", "captions"].indexOf(track.kind) === -1)) continue;
+          tracks.push(track);
+        }
+        return tracks;
+      }
+      function textTrackName(track, index) {
+        return track && (track.label || track.language || track.kind || track.id) ? (track.label || track.language || track.kind || track.id) : "Subtitles " + (index + 1);
+      }
+      function updateSubtitlesButton() {
+        const button = byId("player-subtitles-button");
+        if (!button) return;
+        const tracks = textTrackList();
+        const activeIndex = tracks.findIndex(function(track) { return track.mode === "showing"; });
+        if (activeIndex >= 0) state.selectedTextTrack = activeIndex;
+        button.classList.toggle("active", activeIndex >= 0);
+        button.setAttribute("aria-pressed", activeIndex >= 0 ? "true" : "false");
+        button.setAttribute("aria-label", activeIndex >= 0 ? "Subtitles: " + textTrackName(tracks[activeIndex], activeIndex) : "Subtitles");
+      }
+      function toggleSubtitles() {
+        const tracks = textTrackList();
+        closePlayerPopovers();
+        if (!tracks.length) {
+          showPlayerToast("No subtitles are available for this stream.");
+          updateSubtitlesButton();
+          return;
+        }
+        const activeIndex = tracks.findIndex(function(track) { return track.mode === "showing"; });
+        const nextIndex = activeIndex >= 0 && activeIndex < tracks.length - 1 ? activeIndex + 1 : (activeIndex >= 0 ? -1 : Math.max(0, state.selectedTextTrack));
+        tracks.forEach(function(track, index) {
+          track.mode = index === nextIndex ? "showing" : "disabled";
+        });
+        state.selectedTextTrack = nextIndex;
+        updateSubtitlesButton();
+        showPlayerToast(nextIndex >= 0 ? "Subtitles: " + textTrackName(tracks[nextIndex], nextIndex) : "Subtitles off.");
+      }
+      function updateAudioMenu() {
+        const button = byId("player-audio-button");
+        const languageButton = byId("player-language-button");
+        const menu = byId("player-audio-menu");
+        if (!button || !menu) return;
+        const tracks = audioTrackList();
+        const activeIndex = tracks.findIndex(function(track) { return !!track.enabled; });
+        state.selectedAudioTrack = activeIndex >= 0 ? activeIndex : state.selectedAudioTrack;
+        const activeLabel = tracks.length ? audioTrackName(tracks[state.selectedAudioTrack] || tracks[0], state.selectedAudioTrack || 0) : "Default audio";
+        button.innerHTML = icon("language") + "<span>" + escapeHTML(activeLabel) + "</span>" + icon("chevron-down");
+        button.setAttribute("aria-expanded", state.audioMenuOpen ? "true" : "false");
+        if (languageButton) {
+          languageButton.classList.toggle("active", state.audioMenuOpen && tracks.length > 1);
+          languageButton.setAttribute("aria-expanded", state.audioMenuOpen && tracks.length > 1 ? "true" : "false");
+          languageButton.setAttribute("aria-label", tracks.length > 1 ? "Audio language: " + activeLabel : "Audio language");
+        }
+        menu.classList.toggle("open", state.audioMenuOpen);
+        updatePlayerChrome();
+        menu.innerHTML = tracks.length ? tracks.map(function(track, index) {
+          return "<button type=\"button\" role=\"menuitem\" data-player-action=\"audio-track\" data-audio-index=\"" + index + "\" class=\"" + (index === state.selectedAudioTrack ? "active" : "") + "\">" + escapeHTML(audioTrackName(track, index)) + "</button>";
+        }).join("") : "<button type=\"button\" role=\"menuitem\" class=\"active\" data-player-action=\"audio-track\" data-audio-index=\"0\">Default audio</button>";
+      }
+      function toggleLanguageMenu() {
+        const tracks = audioTrackList();
+        if (tracks.length <= 1) {
+          closePlayerPopovers();
+          showPlayerToast("No alternate audio languages are available for this stream.");
+          return;
+        }
+        state.audioMenuOpen = !state.audioMenuOpen;
+        closePlayerPopovers("audio");
+        updateAudioMenu();
+      }
+      function selectAudioTrack(index) {
+        const tracks = audioTrackList();
+        if (!tracks.length) {
+          state.selectedAudioTrack = 0;
+          state.audioMenuOpen = false;
+          updateAudioMenu();
+          return;
+        }
+        tracks.forEach(function(track, trackIndex) { track.enabled = trackIndex === index; });
+        state.selectedAudioTrack = index;
+        state.audioMenuOpen = false;
+        updateAudioMenu();
+      }
+      function volumeLabel() {
+        if (state.muted || state.volume <= 0) return "0%";
+        return Math.round(state.volume * 100) + "%";
+      }
+      function applyVolumeToVideo() {
+        const video = byId("player");
+        state.volume = Math.max(0, Math.min(1, Number(state.volume) || 0));
+        state.muted = state.volume <= 0;
+        if (video) {
+          video.volume = state.volume;
+          video.muted = state.muted;
+        }
+        updateVolumeMenu();
+      }
+      function updateVolumeMenu() {
+        const button = byId("player-volume-button");
+        const popover = byId("player-volume-popover");
+        const slider = byId("player-volume-slider");
+        const value = byId("player-volume-value");
+        if (!button || !popover) return;
+        button.innerHTML = icon(state.muted || state.volume <= 0 ? "speaker-off" : "speaker");
+        button.setAttribute("aria-expanded", state.volumeMenuOpen ? "true" : "false");
+        popover.classList.toggle("open", state.volumeMenuOpen);
+        if (slider) slider.value = String(Math.round(state.volume * 100));
+        if (value) value.textContent = volumeLabel();
+        updatePlayerChrome();
+      }
+      function closePlayerPopovers(except) {
+        if (except !== "audio") state.audioMenuOpen = false;
+        if (except !== "volume") state.volumeMenuOpen = false;
+        if (except !== "more") state.moreMenuOpen = false;
+        updateAudioMenu();
+        updateVolumeMenu();
+        renderPlayerMoreMenu();
+      }
+      function showPlayerToast(message) {
+        const toast = byId("player-toast");
+        if (!toast) return;
+        toast.textContent = message;
+        toast.classList.add("show");
+        clearTimeout(state.toastTimer);
+        state.toastTimer = setTimeout(function() { toast.classList.remove("show"); }, 2400);
+      }
+      function showAppToast(message) {
+        let toast = byId("app-toast");
+        if (!toast) {
+          toast = document.createElement("div");
+          toast.id = "app-toast";
+          toast.className = "app-toast";
+          toast.setAttribute("role", "status");
+          document.body.appendChild(toast);
+        }
+        toast.textContent = message;
+        toast.classList.add("show");
+        clearTimeout(state.appToastTimer);
+        state.appToastTimer = setTimeout(function() { toast.classList.remove("show"); }, 2600);
+      }
+      async function openCastPicker() {
+        const video = byId("player");
+        if (!video) return;
+        closePlayerPopovers();
+        try {
+          if (typeof video.webkitShowPlaybackTargetPicker === "function") {
+            video.webkitShowPlaybackTargetPicker();
+            return;
+          }
+          if (video.remote && typeof video.remote.prompt === "function") {
+            await video.remote.prompt();
+            return;
+          }
+          showPlayerToast("AirPlay or Cast is not available in this browser.");
+        } catch (error) {
+          showPlayerToast("No playback target selected.");
+        }
+      }
+      async function togglePictureInPicture() {
+        const video = byId("player");
+        if (!video) return;
+        closePlayerPopovers();
+        if (!document.pictureInPictureEnabled || typeof video.requestPictureInPicture !== "function") {
+          showPlayerToast("Picture in Picture is not available in this browser.");
+          return;
+        }
+        try {
+          if (document.pictureInPictureElement) await document.exitPictureInPicture();
+          else await video.requestPictureInPicture();
+        } catch (error) {
+          showPlayerToast("Picture in Picture could not be opened.");
+        }
+      }
+      function updateCenterPlayButton() {
+        const video = byId("player");
+        const button = byId("player-center-button");
+        if (!video || !button) return;
+        const loading = !!state.playerWaiting && !video.paused;
+        const show = loading || video.paused;
+        button.classList.toggle("hidden", !show);
+        button.classList.toggle("loading", loading);
+        button.innerHTML = loading ? icon("loader") : icon(video.paused ? "play" : "pause");
+        button.setAttribute("aria-label", loading ? "Loading stream" : (video.paused ? "Play" : "Pause"));
+        button.disabled = loading;
+      }
+      function togglePlayPause() {
+        const video = byId("player");
+        if (!video) return;
+        closePlayerPopovers();
+        if (video.paused) video.play().catch(function() { showPlayerToast("Playback could not be started."); });
+        else video.pause();
+        updateCenterPlayButton();
+      }
+      function fullscreenElement() {
+        return document.fullscreenElement || document.webkitFullscreenElement || null;
+      }
+      function updateFullscreenButton() {
+        const button = byId("player-fullscreen-button");
+        if (!button) return;
+        const active = !!fullscreenElement();
+        button.innerHTML = icon(active ? "fullscreen-exit" : "fullscreen");
+        button.classList.toggle("active", active);
+        button.setAttribute("aria-pressed", active ? "true" : "false");
+        button.setAttribute("aria-label", active ? "Exit fullscreen" : "Fullscreen");
+        renderPlayerMoreMenu();
+      }
+      async function toggleFullscreen() {
+        const shell = document.querySelector(".playback-shell");
+        closePlayerPopovers();
+        try {
+          if (fullscreenElement()) {
+            if (document.exitFullscreen) await document.exitFullscreen();
+            else if (document.webkitExitFullscreen) document.webkitExitFullscreen();
+          } else if (shell) {
+            if (shell.requestFullscreen) await shell.requestFullscreen();
+            else if (shell.webkitRequestFullscreen) shell.webkitRequestFullscreen();
+            else showPlayerToast("Fullscreen is not available in this browser.");
+          }
+        } catch (error) {
+          showPlayerToast("Fullscreen could not be changed.");
+        }
+        updateFullscreenButton();
+      }
+      function setVideoSource(url) {
+        const video = byId("player");
+        if (!video) return;
+        applyVolumeToVideo();
+        state.selectedAudioTrack = 0;
+        state.selectedTextTrack = -1;
+        state.audioMenuOpen = false;
+        state.volumeMenuOpen = false;
+        state.moreMenuOpen = false;
+        updateAudioMenu();
+        updateSubtitlesButton();
+        updateVolumeMenu();
+        renderPlayerMoreMenu();
+        if (video.audioTracks && video.audioTracks.addEventListener) {
+          video.audioTracks.addEventListener("addtrack", updateAudioMenu);
+          video.audioTracks.addEventListener("removetrack", updateAudioMenu);
+          video.audioTracks.addEventListener("change", updateAudioMenu);
+        }
+        video.addEventListener("loadedmetadata", updateAudioMenu, { once: true });
+        video.addEventListener("loadedmetadata", updateSubtitlesButton, { once: true });
+        video.addEventListener("waiting", function() { state.playerWaiting = true; updateCenterPlayButton(); });
+        video.addEventListener("stalled", function() { state.playerWaiting = true; updateCenterPlayButton(); });
+        video.addEventListener("canplay", function() { state.playerWaiting = false; updateCenterPlayButton(); });
+        video.addEventListener("playing", function() { state.playerWaiting = false; updateCenterPlayButton(); });
+        video.addEventListener("pause", updateCenterPlayButton);
+        video.addEventListener("play", updateCenterPlayButton);
+        video.addEventListener("error", function() { state.playerWaiting = false; updateCenterPlayButton(); });
+        if (video.textTracks && video.textTracks.addEventListener) {
+          video.textTracks.addEventListener("addtrack", updateSubtitlesButton);
+          video.textTracks.addEventListener("removetrack", updateSubtitlesButton);
+          video.textTracks.addEventListener("change", updateSubtitlesButton);
+        }
+        if (state.hls) { state.hls.destroy(); state.hls = null; }
+        if (state.tsPlayer) { state.tsPlayer.destroy(); state.tsPlayer = null; }
+        const isHLS = url.indexOf(".m3u8") !== -1;
+        if (window.Hls && Hls.isSupported() && isHLS) {
+          state.hls = new Hls();
+          state.hls.loadSource(url);
+          state.hls.attachMedia(video);
+        } else if (window.mpegts && mpegts.isSupported() && !isHLS) {
+          state.tsPlayer = mpegts.createPlayer({ type: "mpegts", isLive: true, url: url });
+          state.tsPlayer.attachMediaElement(video);
+          state.tsPlayer.load();
+        } else {
+          video.src = url;
+        }
+        setTimeout(updateAudioMenu, 500);
+        setTimeout(updateAudioMenu, 1800);
+        setTimeout(updateSubtitlesButton, 500);
+        setTimeout(updateSubtitlesButton, 1800);
+        updateCenterPlayButton();
+        applyAspectMode();
+        video.play().then(updateCenterPlayButton).catch(function() { updateCenterPlayButton(); });
+      }
+      async function playChannel(channel) {
+        state.currentChannel = channel;
+        state.view = "player";
+        render();
+        setVideoSource(browserStreamURL(channel));
+        startWatch(channel);
+        const guide = await getJSON("/dispatcharr/api/guide?channel_id=" + encodeURIComponent(channel.id)).catch(function() { return { programs: [] }; });
+        const nowGuide = byId("now-guide");
+        if (nowGuide) nowGuide.innerHTML = items(guide.programs).slice(0, 6).map(function(program) { return "<div class=\"program\"><time>" + escapeHTML(timeLabel(program.startUnix)) + "</time><strong>" + escapeHTML(program.title || "Untitled") + "</strong></div>"; }).join("") || "<div class=\"empty\">No guide entries.</div>";
+      }
+      function startWatch(channel) {
+        if (state.currentSession) postJSON("/dispatcharr/api/watch/stop", { sessionId: state.currentSession.id, reason: "switch_channel" }).catch(function() {});
+        recordWatchPreference(channel);
+        postJSON("/dispatcharr/api/watch/start", { itemKind: "channel", itemId: channel.id, itemName: channel.name }).then(function(payload) {
+          state.currentSession = payload.session;
+          if (state.heartbeat) clearInterval(state.heartbeat);
+          state.heartbeat = setInterval(function() {
+            if (state.currentSession) postJSON("/dispatcharr/api/watch/heartbeat", { sessionId: state.currentSession.id }).catch(function() {});
+          }, 30000);
+          renderRail();
+        }).catch(function() {});
+      }
+      function handlePlayerAction(action, button) {
+        const video = byId("player");
+        wakePlayerChrome();
+        if (action === "back") {
+          setView("live");
+          return;
+        }
+        if (action === "guide") {
+          state.playerGuideOpen = !state.playerGuideOpen;
+          closePlayerPopovers();
+          renderPlayerGuidePanel();
+          return;
+        }
+        if (action === "guide-close") {
+          state.playerGuideOpen = false;
+          renderPlayerGuidePanel();
+          return;
+        }
+        if (action === "cast") {
+          closePlayerPopovers();
+          openCastPicker();
+          return;
+        }
+        if (action === "pip") {
+          togglePictureInPicture();
+          return;
+        }
+        if (action === "play-toggle") {
+          togglePlayPause();
+          return;
+        }
+        if (action === "fullscreen") {
+          toggleFullscreen();
+          return;
+        }
+        if (action === "subtitles") {
+          toggleSubtitles();
+          return;
+        }
+        if (action === "volume-menu") {
+          state.volumeMenuOpen = !state.volumeMenuOpen;
+          closePlayerPopovers("volume");
+          updateVolumeMenu();
+          return;
+        }
+        if (action === "audio-menu") {
+          state.audioMenuOpen = !state.audioMenuOpen;
+          closePlayerPopovers("audio");
+          updateAudioMenu();
+          return;
+        }
+        if (action === "language-menu") {
+          toggleLanguageMenu();
+          return;
+        }
+        if (action === "audio-track") {
+          selectAudioTrack(Number(button && button.getAttribute("data-audio-index")) || 0);
+          return;
+        }
+        if (action === "more") {
+          state.moreMenuOpen = !state.moreMenuOpen;
+          closePlayerPopovers("more");
+          renderPlayerMoreMenu();
+          return;
+        }
+        if (action === "aspect") {
+          state.aspectMode = state.aspectMode === "fit" ? "fill" : "fit";
+          applyAspectMode();
+          renderPlayerMoreMenu();
+          return;
+        }
+        if (action === "search-channel") {
+          state.moreMenuOpen = false;
+          renderPlayerMoreMenu();
+          const search = byId("global-search");
+          if (search) search.focus();
+          return;
+        }
+        if (action === "copy-stream") {
+          const url = currentStreamURL();
+          if (url && navigator.clipboard) navigator.clipboard.writeText(new URL(url, window.location.href).href).then(function() { showPlayerToast("Stream URL copied."); }).catch(function() { showPlayerToast("Could not copy stream URL."); });
+          else showPlayerToast("No stream URL available.");
+          state.moreMenuOpen = false;
+          renderPlayerMoreMenu();
+          return;
+        }
+        if (action === "open-stream") {
+          const url = currentStreamURL();
+          if (url) window.open(url, "_blank", "noopener");
+          state.moreMenuOpen = false;
+          renderPlayerMoreMenu();
+          return;
+        }
+        if (action === "favorite" && state.currentChannel) {
+          const id = state.currentChannel.id;
+          if (favoriteMap()[id]) delete state.app.preferences.favorites[id];
+          else state.app.preferences.favorites[id] = true;
+          if (button) {
+            const isFavorite = !!favoriteMap()[id];
+            button.innerHTML = icon(isFavorite ? "heart-solid" : "heart");
+            button.classList.toggle("active", isFavorite);
+            button.setAttribute("aria-pressed", isFavorite ? "true" : "false");
+            button.setAttribute("aria-label", isFavorite ? "Remove channel from favorites" : "Favorite channel");
+          }
+          savePrefs();
+          postJSON("/dispatcharr/api/favorites", { id: id, enabled: !!favoriteMap()[id] }).catch(function() {});
+          renderRail();
+        }
+      }
+      document.addEventListener("click", function(event) {
+        const playerTarget = event.target.closest("[data-player-action]");
+        if (playerTarget) {
+          event.preventDefault();
+          handlePlayerAction(playerTarget.getAttribute("data-player-action"), playerTarget);
+          return;
+        }
+        const recordingsRefresh = event.target.closest("[data-recordings-refresh]");
+        if (recordingsRefresh) {
+          event.preventDefault();
+          state.recordings = null;
+          loadRecordings(true);
+          renderRecordingsPage();
+          return;
+        }
+        const guideRefresh = event.target.closest("[data-guide-refresh]");
+        if (guideRefresh) {
+          event.preventDefault();
+          refreshAppData();
+          return;
+        }
+        const recordingPlayback = event.target.closest("[data-recording-playback]");
+        if (recordingPlayback) {
+          event.preventDefault();
+          const url = recordingPlayback.getAttribute("data-recording-playback");
+          if (url) window.open(url, "_blank", "noopener");
+          return;
+        }
+        const scheduleTarget = event.target.closest("[data-schedule-channel]");
+        if (scheduleTarget) {
+          event.preventDefault();
+          event.stopPropagation();
+          scheduleProgram(scheduleTarget.getAttribute("data-schedule-channel"), scheduleTarget.getAttribute("data-schedule-program"), scheduleTarget);
+          return;
+        }
+        const channelTarget = event.target.closest("[data-channel]");
+        if (channelTarget) {
+          const channel = channelByID(channelTarget.getAttribute("data-channel"));
+          if (channel) playChannel(channel);
+        }
+        const categoryTarget = event.target.closest("[data-category]");
+        if (categoryTarget) setCategory(categoryTarget.getAttribute("data-category"));
+      });
+      document.addEventListener("fullscreenchange", updateFullscreenButton);
+      document.addEventListener("webkitfullscreenchange", updateFullscreenButton);
+      document.addEventListener("keydown", function(event) {
+        if (state.view !== "player") return;
+        const tag = event.target && event.target.tagName ? event.target.tagName.toLowerCase() : "";
+        if (tag === "input" || tag === "textarea" || tag === "select") return;
+        if (event.key === " " || event.key === "k" || event.key === "K") {
+          event.preventDefault();
+          togglePlayPause();
+        }
+        if (event.key === "f" || event.key === "F") {
+          event.preventDefault();
+          toggleFullscreen();
+        }
+      });
+      ["mousemove", "mousedown", "touchstart", "keydown"].forEach(function(eventName) {
+        document.addEventListener(eventName, function(event) {
+          if (state.view !== "player") return;
+          if (eventName === "mousemove" && event.movementX === 0 && event.movementY === 0) return;
+          wakePlayerChrome();
+        }, { passive: true });
+      });
+      document.addEventListener("change", function(event) {
+        const id = event.target.getAttribute("data-hide");
+        if (!id) return;
+        if (event.target.checked) state.app.preferences.hiddenCategories[id] = true;
+        else delete state.app.preferences.hiddenCategories[id];
+        savePrefs();
+        postJSON("/dispatcharr/api/hidden-categories", { id: id, hidden: event.target.checked }).catch(function() {});
+        render();
+      });
+      document.addEventListener("input", function(event) {
+        if (event.target && event.target.id === "player-volume-slider") {
+          state.volume = Number(event.target.value || 0) / 100;
+          applyVolumeToVideo();
+        }
+      });
+      document.querySelectorAll(".nav button").forEach(function(button) {
+        button.onclick = function() { setView(button.dataset.view); };
+      });
+      byId("global-search").oninput = function(event) { state.query = event.target.value; render(); };
+      window.addEventListener("scroll", function() {
+        if (state.view === "guide" && isNearGuideEnd()) appendGuideRows();
+      }, { passive: true });
+      window.addEventListener("beforeunload", function() {
+        if (state.currentSession) navigator.sendBeacon(route("/dispatcharr/api/watch/stop"), JSON.stringify({ sessionId: state.currentSession.id, reason: "page_unload" }));
+      });
+      loadApp().catch(function() {
+        byId("view").innerHTML = "<div class=\"empty\">Unable to load Live TV app data.</div>";
+      });
+    </script>
+  </body>
+</html>`

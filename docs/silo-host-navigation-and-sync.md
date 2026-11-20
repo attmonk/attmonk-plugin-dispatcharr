@@ -10,12 +10,12 @@ Silo's user sidebar has an Apps section for installed plugins. A plugin route ap
   "path": "/dispatcharr",
   "access": "authenticated",
   "navigable": true,
-  "navigation_label": "Live TV (Dispatcharr)",
+  "navigation_label": "IPTV",
   "navigation_kind": "user"
 }
 ```
 
-The Silo SDK v0.8.1 includes the required fields on `HttpRouteDescriptor`:
+The local Silo SDK v0.7.0 includes the required fields on `HttpRouteDescriptor`:
 
 - `navigable`
 - `navigation_label`
@@ -25,12 +25,10 @@ Use `navigation_kind: "user"` for normal user sidebar Apps entries. Use `navigat
 
 ## Dispatcharr sync task
 
-The plugin exposes three scheduled task capabilities:
+The plugin exposes one scheduled task capability:
 
 ```text
 dispatcharr-sync
-dispatcharr-refresh-channels
-dispatcharr-refresh-epg
 ```
 
 Silo registers that task as:
@@ -39,7 +37,7 @@ Silo registers that task as:
 plugin:<installation_id>:dispatcharr-sync
 ```
 
-Current Silo host builds store task cadence outside of the plugin manifest. If no task binding trigger is configured, Silo falls back to a startup-only trigger. Configure full/channel refreshes at a slower cadence and EPG refreshes more frequently, for example:
+Current Silo host builds store task cadence outside of the plugin manifest. If no task binding trigger is configured, Silo falls back to a startup-only trigger. For Dispatcharr, configure:
 
 ```json
 [
@@ -48,6 +46,4 @@ Current Silo host builds store task cadence outside of the plugin manifest. If n
 ]
 ```
 
-The startup trigger hydrates channels and EPG after install/restart. Silo owns
-these trigger definitions; refresh-hour fields are intentionally not exposed in
-the plugin config form.
+The startup trigger hydrates channels and EPG after install/restart. The interval trigger refreshes channels and EPG every 24 hours.

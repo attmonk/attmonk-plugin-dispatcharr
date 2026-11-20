@@ -2,68 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"reflect"
-	"strings"
-	"sync/atomic"
 	"testing"
 
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
-	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/capability"
 	configsdk "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/config"
-	publicmanifest "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/config"
 	"google.golang.org/protobuf/types/known/structpb"
 )
-
-func TestConfigurationCheckUsesOnlyDraftCredentials(t *testing.T) {
-	for _, tc := range []struct {
-		name   string
-		status int
-		key    string
-		ok     bool
-	}{
-		{"accepted", http.StatusOK, "draft-sensitive-key", true},
-		{"rejected", http.StatusUnauthorized, "draft-sensitive-key", false},
-		{"cleared key", http.StatusOK, "", false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			var calls atomic.Int32
-			upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				calls.Add(1)
-				if r.URL.Path != "/api/accounts/users/me/" || r.Header.Get("X-API-Key") != tc.key {
-					t.Error("check did not use the draft source and credentials")
-				}
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(tc.status)
-				_, _ = w.Write([]byte(`{"message":"draft-sensitive-key"}`))
-			}))
-			defer upstream.Close()
-			saved := config.Settings{SourceMode: config.SourceModeXtream, XtreamBaseURL: "https://saved.example.invalid", XtreamPassword: "saved-sensitive-key"}
-			state := &settingsState{settings: saved}
-			server := &runtimeServer{settings: state}
-			value, err := structpb.NewStruct(map[string]any{"source_mode": "api_key", "base_url": upstream.URL, "api_key": tc.key})
-			if err != nil {
-				t.Fatal(err)
-			}
-			result, err := server.TestConfiguration(t.Context(), &pluginv1.TestConfigurationRequest{Config: []*pluginv1.ConfigEntry{{Key: "connection", Value: value}}})
-			if err != nil || result.GetOk() != tc.ok {
-				t.Fatalf("configuration check = %v, %v", result, err)
-			}
-			if tc.key == "" && calls.Load() != 0 || tc.key != "" && calls.Load() != 1 {
-				t.Fatalf("upstream requests = %d", calls.Load())
-			}
-			if strings.Contains(result.GetMessage(), "sensitive-key") {
-				t.Fatal("configuration check exposed credentials from the response")
-			}
-			if !reflect.DeepEqual(state.Get(), saved) {
-				t.Fatal("configuration check changed the running settings")
-			}
-		})
-	}
-}
 
 func TestRuntimeConfigureReadsObjectShapedConfigEntries(t *testing.T) {
 	t.Parallel()
@@ -85,37 +30,6 @@ func TestRuntimeConfigureReadsObjectShapedConfigEntries(t *testing.T) {
 	}
 	if settings.DispatcharrURL == "" || settings.DispatcharrAPIKey == "" {
 		t.Fatalf("expected dispatcharr connection to be loaded, got %+v", settings)
-	}
-}
-
-func TestRuntimeConfigurePreservesSecretsOmittedByHost(t *testing.T) {
-	t.Parallel()
-
-	state := &settingsState{settings: config.Settings{
-		SourceMode:        config.SourceModeAPIKey,
-		DispatcharrURL:    "https://dispatcharr.example.com",
-		DispatcharrAPIKey: "existing-secret",
-		ChannelRefreshH:   config.DefaultChannelRefreshHours,
-		EPGRefreshH:       config.DefaultEPGRefreshHours,
-	}}
-	server := &runtimeServer{settings: state}
-	request := &pluginv1.ConfigureRequest{Config: []*pluginv1.ConfigEntry{
-		{Key: "connection", Value: mustStruct(t, map[string]any{
-			"source_mode":     "api_key",
-			"base_url":        "https://dispatcharr.example.com",
-			"channel_profile": "attmonk | NY",
-		})},
-	}}
-
-	if _, err := server.Configure(context.Background(), request); err != nil {
-		t.Fatalf("configure: %v", err)
-	}
-	settings := state.Get()
-	if settings.DispatcharrAPIKey != "existing-secret" {
-		t.Fatalf("omitted secret was erased: %+v", settings)
-	}
-	if settings.ChannelProfile != "attmonk | NY" {
-		t.Fatalf("expected present profile field to update: %+v", settings)
 	}
 }
 
@@ -176,32 +90,6 @@ func TestRuntimeConfigureMapsM3UXMLTVFromConnectionEntry(t *testing.T) {
 	}
 }
 
-func TestRuntimeConfigureReadsCategorySettings(t *testing.T) {
-	t.Parallel()
-
-	state := &settingsState{settings: config.Settings{SourceMode: config.SourceModeDirectLogin, LiveTVEnabled: true, ChannelRefreshH: config.DefaultChannelRefreshHours, EPGRefreshH: config.DefaultEPGRefreshHours}}
-	server := &runtimeServer{settings: state}
-
-	req := &pluginv1.ConfigureRequest{Config: []*pluginv1.ConfigEntry{
-		{Key: "category_settings", Value: mustStruct(t, map[string]any{
-			"mode":      "delimiter",
-			"delimiter": "pipe",
-		})},
-	}}
-
-	if _, err := server.Configure(context.Background(), req); err != nil {
-		t.Fatalf("configure: %v", err)
-	}
-
-	var settings map[string]any
-	if err := json.Unmarshal(state.Get().AdminSettings, &settings); err != nil {
-		t.Fatalf("decode admin settings: %v", err)
-	}
-	if settings["mode"] != "delimiter" || settings["delimiter"] != "pipe" {
-		t.Fatalf("expected category settings to be loaded, got %+v", settings)
-	}
-}
-
 func TestManifestGlobalConfigSchemasValidateExpectedObjects(t *testing.T) {
 	t.Parallel()
 
@@ -210,211 +98,18 @@ func TestManifestGlobalConfigSchemasValidateExpectedObjects(t *testing.T) {
 		t.Fatalf("load manifest: %v", err)
 	}
 
-	if err := configsdk.ValidateManifestGlobalValue(manifest, "connection", map[string]any{"source_mode": "api_key", "base_url": "https://dispatcharr.example.com", "api_key": "secret"}); err != nil {
+	if err := configsdk.ValidateManifestGlobalValue(manifest, "connection", map[string]any{"source_mode": "api_key", "base_url": "https://dispatcharr.example.com", "api_key": "secret", "live_tv_enabled": true}); err != nil {
 		t.Fatalf("validate connection schema: %v", err)
 	}
-	if err := configsdk.ValidateManifestGlobalValue(manifest, "connection", map[string]any{"source_mode": "xtream", "base_url": "https://provider.example.com", "username": "demo", "password": "secret", "epg_xml_url": "https://provider.example.com/guide.xml"}); err != nil {
+	if err := configsdk.ValidateManifestGlobalValue(manifest, "connection", map[string]any{"source_mode": "xtream", "base_url": "https://provider.example.com", "username": "demo", "password": "secret", "epg_xml_url": "https://provider.example.com/guide.xml", "live_tv_enabled": true}); err != nil {
 		t.Fatalf("validate xtream connection schema: %v", err)
 	}
-	if err := configsdk.ValidateManifestGlobalValue(manifest, "connection", map[string]any{"source_mode": "m3u_xmltv", "m3u_url": "https://provider.example.com/playlist.m3u", "epg_xml_url": "https://provider.example.com/guide.xml"}); err != nil {
+	if err := configsdk.ValidateManifestGlobalValue(manifest, "connection", map[string]any{"source_mode": "m3u_xmltv", "m3u_url": "https://provider.example.com/playlist.m3u", "epg_xml_url": "https://provider.example.com/guide.xml", "live_tv_enabled": true}); err != nil {
 		t.Fatalf("validate m3u/xmltv connection schema: %v", err)
 	}
 	if err := configsdk.ValidateManifestGlobalValue(manifest, "connection", map[string]any{"source_mode": "m3u_xmltv", "m3u_url": "https://provider.example.com/playlist.m3u"}); err == nil {
 		t.Fatalf("expected incomplete m3u/xmltv connection to fail validation")
 	}
-	if err := configsdk.ValidateManifestGlobalValue(manifest, "category_settings", map[string]any{
-		"mode":                           "delimiter",
-		"delimiter":                      "pipe",
-		"virtualGroupSource":             "profile_group",
-		"collapseDuplicateVirtualGroups": true,
-		"ecmEnabled":                     false,
-		"ecmURL":                         "https://ecm.example.test/manage",
-		"categoryAliases": []any{
-			map[string]any{"sourcePath": "International | Arabic | Sports", "aliasPath": "Sports | Arabic"},
-			map[string]any{"sourcePath": "International | Arabic | Sports", "aliasPath": "World Cup | Arabic"},
-		},
-		"eventKeywords": []any{
-			map[string]any{"categoryId": "entertainment", "categoryName": "Entertainment", "keywords": []any{"Festival"}},
-		},
-	}); err != nil {
-		t.Fatalf("validate category settings schema: %v", err)
-	}
-}
-
-func TestManifestUserPreferenceSchemaAcceptsBrowserPayload(t *testing.T) {
-	t.Parallel()
-
-	manifest, err := loadManifest()
-	if err != nil {
-		t.Fatalf("load manifest: %v", err)
-	}
-	preferences := map[string]any{
-		"favorites":                  map[string]any{"channel:1": true},
-		"favoriteOrder":              []any{"channel:1"},
-		"autoFavorites":              map[string]any{},
-		"hiddenCategories":           map[string]any{},
-		"sportsFavoriteTeams":        map[string]any{},
-		"sportsFavoriteLeagues":      map[string]any{"wnba": true},
-		"sportsPreferredChannels":    map[string]any{"wnba": "channel:1"},
-		"sportsPreferredNetworks":    map[string]any{"wnba": "espn"},
-		"sportsSpoilersHidden":       false,
-		"sportsPlayerSpoilersHidden": true,
-		"keywordPasses":              []any{map[string]any{"id": "pass:1", "keyword": "World Cup", "createdAt": float64(100)}},
-		"recentSearches":             []any{"World Cup"},
-		"recentChannels":             []any{"channel:1"},
-		"continueWatching":           map[string]any{"channel:1": map[string]any{"plays": float64(1)}},
-		"playback":                   map[string]any{"streamMode": "redirect", "outputFormat": "ts"},
-		"categoryParsing":            map[string]any{"enabled": true, "mode": "delimiter", "delimiter": "pipe", "regex": "", "output": ""},
-		"customGroups":               []any{map[string]any{"id": "group:news", "name": "News", "order": float64(1)}},
-		"customGroupMemberships": map[string]any{
-			"group:news": []any{"channel:1"},
-		},
-		"savedLineups": []any{map[string]any{
-			"id":              "new-york-tv",
-			"name":            "New York TV",
-			"categoryId":      "virtual:US TV / NY",
-			"hideFinalGroups": true,
-		}},
-		"profiles": map[string]any{
-			"p2": map[string]any{
-				"favorites":        map[string]any{"channel:2": true},
-				"favoriteOrder":    []any{"channel:2"},
-				"hiddenCategories": map[string]any{"7": true},
-			},
-		},
-	}
-	if err := configsdk.ValidateManifestUserValue(manifest, "preferences", preferences); err != nil {
-		t.Fatalf("validate browser preference payload: %v", err)
-	}
-}
-
-func TestManifestExposesAdminNavigationRoute(t *testing.T) {
-	t.Parallel()
-
-	manifest, err := loadManifest()
-	if err != nil {
-		t.Fatalf("load manifest: %v", err)
-	}
-
-	for _, route := range manifest.GetHttpRoutes() {
-		if route.GetPath() != "/dispatcharr/admin" {
-			continue
-		}
-		if !route.GetNavigable() || route.GetNavigationKind() != "admin" || route.GetNavigationLabel() != "Dispatcharr Admin" || route.GetAccess() != "admin" {
-			t.Fatalf("unexpected admin route metadata: %+v", route)
-		}
-		return
-	}
-	t.Fatalf("expected manifest to expose /dispatcharr/admin as a navigable admin route")
-}
-
-func TestManifestExposesSportsNavigationRoute(t *testing.T) {
-	t.Parallel()
-
-	manifest, err := loadManifest()
-	if err != nil {
-		t.Fatalf("load manifest: %v", err)
-	}
-
-	for _, route := range manifest.GetHttpRoutes() {
-		if route.GetPath() != "/dispatcharr/sports" {
-			continue
-		}
-		if !route.GetNavigable() || route.GetNavigationKind() != "user" || route.GetNavigationLabel() != "Sports" || route.GetAccess() != "authenticated" {
-			t.Fatalf("unexpected sports route metadata: %+v", route)
-		}
-		return
-	}
-	t.Fatalf("expected manifest to expose /dispatcharr/sports as a navigable Sports app")
-}
-
-func TestManifestExposesAdminSettingsAPIRoutes(t *testing.T) {
-	t.Parallel()
-
-	manifest, err := loadManifest()
-	if err != nil {
-		t.Fatalf("load manifest: %v", err)
-	}
-
-	found := map[string]bool{}
-	for _, route := range manifest.GetHttpRoutes() {
-		if route.GetPath() != "/dispatcharr/api/admin-settings" {
-			continue
-		}
-		expectedAccess := "authenticated"
-		if route.GetMethod() == http.MethodPost {
-			expectedAccess = "admin"
-		}
-		if route.GetAccess() != expectedAccess || route.GetNavigable() {
-			t.Fatalf("unexpected admin settings route metadata: %+v", route)
-		}
-		found[route.GetMethod()] = true
-	}
-	if !found["GET"] || !found["POST"] {
-		t.Fatalf("expected manifest to expose admin settings GET and POST routes, got %+v", found)
-	}
-}
-
-func TestManifestExposesRefreshTaskCapabilities(t *testing.T) {
-	t.Parallel()
-
-	manifest, err := loadManifest()
-	if err != nil {
-		t.Fatalf("load manifest: %v", err)
-	}
-
-	scheduledTaskIDs := make([]string, 0)
-	for _, item := range manifest.GetCapabilities() {
-		if item.GetType() == capability.ScheduledTask {
-			scheduledTaskIDs = append(scheduledTaskIDs, item.GetId())
-		}
-	}
-	want := []string{"dispatcharr-sync", "dispatcharr-refresh-channels", "dispatcharr-refresh-epg"}
-	if !reflect.DeepEqual(scheduledTaskIDs, want) {
-		t.Fatalf("expected scheduled task capabilities %+v, got %+v", want, scheduledTaskIDs)
-	}
-}
-
-func TestManifestUsesSDKCatalogPresentation(t *testing.T) {
-	t.Parallel()
-
-	manifest, err := loadManifest()
-	if err != nil {
-		t.Fatalf("load manifest: %v", err)
-	}
-	if err := publicmanifest.ValidateCatalogPresentation(manifest, catalogSourceURL); err != nil {
-		t.Fatalf("catalog presentation: %v", err)
-	}
-	presentation := manifest.GetPresentation()
-	if presentation.GetDisplayName() != "Dispatcharr for Silo" {
-		t.Fatalf("display_name = %q", presentation.GetDisplayName())
-	}
-	if presentation.GetPublisherName() != "ATTMonk" {
-		t.Fatalf("publisher_name = %q, want attmonk", presentation.GetPublisherName())
-	}
-	if !strings.Contains(presentation.GetSummary(), "Silo") {
-		t.Fatalf("summary must mention Silo, got %q", presentation.GetSummary())
-	}
-
-	var types []string
-	for _, item := range manifest.GetCapabilities() {
-		types = append(types, item.GetType())
-	}
-	wantTypes := []string{capability.ScheduledTask, capability.ScheduledTask, capability.ScheduledTask, capability.HTTPRoutes}
-	if !reflect.DeepEqual(types, wantTypes) {
-		t.Fatalf("capability types = %+v, want %+v", types, wantTypes)
-	}
-
-	for _, route := range manifest.GetHttpRoutes() {
-		if route.GetPath() != "/dispatcharr" {
-			continue
-		}
-		if route.GetNavigationLabel() != "Live TV (Dispatcharr)" || route.GetNavigationKind() != "user" {
-			t.Fatalf("unexpected user app route: %+v", route)
-		}
-		return
-	}
-	t.Fatal("expected /dispatcharr to use the Live TV (Dispatcharr) navigation label")
 }
 
 func mustStruct(t *testing.T, value map[string]any) *structpb.Struct {
@@ -424,41 +119,4 @@ func mustStruct(t *testing.T, value map[string]any) *structpb.Struct {
 		t.Fatalf("new struct: %v", err)
 	}
 	return result
-}
-
-func TestManifestRestrictsDestructiveActionsToAdmins(t *testing.T) {
-	t.Parallel()
-
-	manifest, err := loadManifest()
-	if err != nil {
-		t.Fatalf("load manifest: %v", err)
-	}
-	want := map[string]string{
-		"POST /dispatcharr/api/refresh":           "admin",
-		"POST /dispatcharr/api/recordings/stop":   "admin",
-		"POST /dispatcharr/api/recordings/delete": "admin",
-		"POST /dispatcharr/api/recordings":        "authenticated",
-		"GET /dispatcharr/api/recordings":         "authenticated",
-		"GET /silo-compat/livetv/v1/info":         "admin",
-		"GET /silo-compat/livetv/v1/channels":     "authenticated",
-		"GET /silo-compat/livetv/v1/programs":     "authenticated",
-		"GET /silo-compat/livetv/v1/stream":       "admin",
-	}
-	seen := map[string]bool{}
-	for _, route := range manifest.GetHttpRoutes() {
-		key := route.GetMethod() + " " + route.GetPath()
-		expected, ok := want[key]
-		if !ok {
-			continue
-		}
-		seen[key] = true
-		if route.GetAccess() != expected {
-			t.Fatalf("route %s: expected access %q, got %q", key, expected, route.GetAccess())
-		}
-	}
-	for key := range want {
-		if !seen[key] {
-			t.Fatalf("manifest is missing route %s", key)
-		}
-	}
 }

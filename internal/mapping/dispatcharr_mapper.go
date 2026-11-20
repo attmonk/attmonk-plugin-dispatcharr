@@ -46,46 +46,20 @@ func MapDispatcharrVODCategory(category dispatcharr.VODCategory) model.Category 
 
 func MapDispatcharrProgram(channelID string, program dispatcharr.Program) model.Program {
 	startUnix := parseDispatcharrTime(program.StartTime.String())
-	title, categories := guideDisplayTitle(program.Title.String(), program.SubTitle.String(), append(append([]string{}, program.Categories...), program.CustomProperties.Categories...))
+	title := firstNonEmpty(program.Title.String(), program.SubTitle.String(), "Data not available")
 	return model.Program{
 		ID: model.StableProgramID(model.ProgramIdentity{
-			UpstreamID: program.ID.String() + "|" + channelID,
+			UpstreamID: program.ID.String(),
 			ChannelID:  channelID,
 			Title:      title,
 			StartUnix:  startUnix,
 		}),
-		ChannelID:  channelID,
-		Title:      title,
-		Summary:    program.Description.String(),
-		ImageURL:   dispatcharrProgramArtworkURL(program.CustomProperties),
-		Categories: categories,
-		StartUnix:  startUnix,
-		EndUnix:    parseDispatcharrTime(program.EndTime.String()),
+		ChannelID: channelID,
+		Title:     title,
+		Summary:   program.Description.String(),
+		StartUnix: startUnix,
+		EndUnix:   parseDispatcharrTime(program.EndTime.String()),
 	}
-}
-
-func dispatcharrProgramArtworkURL(properties dispatcharr.ProgramCustomProperties) string {
-	artwork := properties.Icon.String()
-	poster := ""
-	for _, image := range properties.Images {
-		url := image.URL.String()
-		if url == "" {
-			continue
-		}
-		switch strings.ToLower(strings.TrimSpace(image.Type.String())) {
-		case "backdrop", "background", "landscape":
-			return url
-		case "poster":
-			if poster == "" {
-				poster = url
-			}
-		default:
-			if artwork == "" {
-				artwork = url
-			}
-		}
-	}
-	return firstNonEmpty(poster, artwork)
 }
 
 func MapDispatcharrMovie(movie dispatcharr.Movie, streamURL string) model.VODItem {

@@ -5,16 +5,14 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 
-	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
-	publicmanifest "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
 	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/config"
 	"google.golang.org/protobuf/encoding/protojson"
 )
@@ -50,31 +48,34 @@ func main() {
 		failf("read manifest template: %v", err)
 	}
 
-	manifest, err := publicmanifest.Load(templateData)
-	if err != nil {
-		failf("load manifest template: %v", err)
-	}
-	if err := publicmanifest.ValidateCatalogPresentation(manifest, "https://github.com/attmonk/attmonk-plugin-dispatcharr"); err != nil {
-		failf("catalog presentation: %v", err)
+	var manifest map[string]any
+	if err := json.Unmarshal(templateData, &manifest); err != nil {
+		failf("decode manifest template: %v", err)
 	}
 
-	manifest.PluginId = *pluginID
-	manifest.Version = *version
-	manifest.Checksum = checksum
-	if len(manifest.GetSupportedPlatforms()) == 0 {
-		osValue := firstNonEmpty(*goos, runtime.GOOS)
-		archValue := firstNonEmpty(*goarch, runtime.GOARCH)
-		manifest.SupportedPlatforms = []*pluginv1.SupportedPlatform{{Os: osValue, Arch: archValue}}
+	schemas, err := globalConfigSchemaJSON()
+	if err != nil {
+		failf("build global config schema json: %v", err)
 	}
-	manifest.GlobalConfigSchema = config.GlobalConfigSchema()
-	manifest.UserConfigSchema = config.UserConfigSchema()
+	userSchemas, err := userConfigSchemaJSON()
+	if err != nil {
+		failf("build user config schema json: %v", err)
+	}
+
+	manifest["plugin_id"] = *pluginID
+	manifest["version"] = *version
+	manifest["checksum"] = checksum
+	manifest["supported_platforms"] = []map[string]string{{"os": *goos, "arch": *goarch}}
+	manifest["global_config_schema"] = schemas
+	manifest["user_config_schema"] = userSchemas
 
 	baseName := filepath.Base(*binaryPath)
 	outManifestPath := filepath.Join(filepath.Dir(*binaryPath), baseName+".manifest.json")
-	outManifestData, err := protojson.Marshal(manifest)
+	outManifestData, err := json.MarshalIndent(manifest, "", "  ")
 	if err != nil {
 		failf("encode output manifest: %v", err)
 	}
+	outManifestData = append(outManifestData, '\n')
 	if err := os.WriteFile(outManifestPath, outManifestData, 0644); err != nil {
 		failf("write output manifest: %v", err)
 	}
@@ -93,6 +94,32 @@ func main() {
 	fmt.Printf("manifest=%s\n", outManifestPath)
 	fmt.Printf("checksum=%s\n", outChecksumPath)
 	fmt.Printf("silo_plugin_zip=%s\n", outZipPath)
+}
+
+func globalConfigSchemaJSON() ([]any, error) {
+	entries := config.GlobalConfigSchema()
+	return configSchemaJSON(entries)
+}
+
+func userConfigSchemaJSON() ([]any, error) {
+	entries := config.UserConfigSchema()
+	return configSchemaJSON(entries)
+}
+
+func configSchemaJSON(entries []*config.ConfigSchema) ([]any, error) {
+	result := make([]any, 0, len(entries))
+	for _, entry := range entries {
+		data, err := protojson.Marshal(entry)
+		if err != nil {
+			return nil, err
+		}
+		var decoded any
+		if err := json.Unmarshal(data, &decoded); err != nil {
+			return nil, err
+		}
+		result = append(result, decoded)
+	}
+	return result, nil
 }
 
 func writeUploadZip(path string, binaryData, manifestData []byte) error {
@@ -132,14 +159,4 @@ func fail(message string) {
 
 func failf(format string, args ...any) {
 	fail(fmt.Sprintf(format, args...))
-}
-
-func firstNonEmpty(values ...string) string {
-	for _, value := range values {
-		value = strings.TrimSpace(value)
-		if value != "" {
-			return value
-		}
-	}
-	return ""
 }

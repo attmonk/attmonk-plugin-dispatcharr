@@ -1,8 +1,6 @@
 package config
 
 import (
-	"strings"
-
 	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
 	"google.golang.org/protobuf/types/known/structpb"
 )
@@ -25,9 +23,6 @@ const connectionJSONSchema = `{
       "type": "string",
       "writeOnly": true
     },
-    "channel_profile": {
-      "type": "string"
-    },
     "username": {
       "type": "string"
     },
@@ -39,10 +34,21 @@ const connectionJSONSchema = `{
       "type": "string",
       "format": "uri"
     },
-	    "epg_xml_url": {
-	      "type": "string",
-	      "format": "uri"
-	    }
+    "epg_xml_url": {
+      "type": "string",
+      "format": "uri"
+    },
+    "live_tv_enabled": {
+      "type": "boolean"
+    },
+    "channel_refresh_hours": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "epg_refresh_hours": {
+      "type": "integer",
+      "minimum": 1
+    }
   },
   "required": ["source_mode"],
   "additionalProperties": false,
@@ -98,347 +104,35 @@ const connectionJSONSchema = `{
   ]
 }`
 
-const categorySettingsJSONSchema = `{
-  "type": "object",
-  "properties": {
-    "mode": {
-      "type": "string",
-      "enum": ["normal", "delimiter"],
-      "default": "normal"
-    },
-    "delimiter": {
-      "type": "string",
-      "enum": ["pipe", "dash"],
-      "default": "pipe"
-    },
-    "virtualGroupLabel": {
-      "type": "string",
-      "default": "Virtual Groups"
-    },
-    "appDisplayName": {
-      "type": "string",
-      "maxLength": 80,
-      "default": "Live TV (Dispatcharr)"
-    },
-    "sideMenuMode": {
-      "type": "string",
-      "enum": ["guide", "channels"],
-      "default": "guide"
-    },
-    "onLaterEnabled": {
-      "type": "boolean",
-      "default": true
-    },
-    "ecmEnabled": {
-      "type": "boolean",
-      "default": false
-    },
-    "ecmURL": {
-      "type": "string",
-      "default": ""
-    },
-    "allowRecordingsByDefault": {
-      "type": "boolean",
-      "default": true
-    },
-    "recordingPrePadMinutes": {
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 60,
-      "default": 0
-    },
-    "recordingPostPadMinutes": {
-      "type": "integer",
-      "minimum": 0,
-      "maximum": 60,
-      "default": 0
-    },
-    "recordingComskipEnabled": {
-      "type": "boolean",
-      "default": false
-    },
-    "sportsFirstPlayerEnabled": {
-      "type": "boolean",
-      "default": false
-    },
-    "hlsBufferSeconds": {
-      "type": "integer",
-      "minimum": 5,
-      "maximum": 60,
-      "default": 12
-    },
-		"sportsEnabled": {
-      "type": "boolean",
-      "default": true
-    },
-    "separateSportsApp": {
-      "type": "boolean",
-      "default": false
-    },
-    "sportsLibraryIds": {
-      "type": "array",
-      "items": {
-        "type": "integer",
-        "minimum": 1
-      },
-      "default": []
-    },
-    "sportsGuide": {
-  "type": "object",
-  "properties": {
-    "enabled": {
-      "type": "boolean",
-      "default": true
-    },
-    "groups": {
-      "type": "array",
-      "maxItems": 500,
-      "items": {
-        "type": "object",
-        "properties": {
-          "groupId": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256
-          },
-          "leagueId": {
-            "type": "string",
-            "maxLength": 64
-          },
-          "mode": {
-            "type": "string",
-            "enum": [
-              "auto",
-              "matchup",
-              "session",
-              "off"
-            ]
-          }
-        },
-        "required": [
-          "groupId"
-        ],
-        "additionalProperties": false
-      }
-    },
-    "overrides": {
-      "type": "array",
-      "maxItems": 1000,
-      "items": {
-        "type": "object",
-        "properties": {
-          "channelId": {
-            "type": "string",
-            "minLength": 1,
-            "maxLength": 256
-          },
-          "eventId": {
-            "type": "string",
-            "maxLength": 512
-          },
-          "disabled": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "channelId"
-        ],
-        "additionalProperties": false
-      }
-    }
-  },
-  "additionalProperties": false
-},
-    "sportsTeamChannels": {
-      "type": "array",
-      "maxItems": 200,
-      "items": {
-        "type": "object",
-        "properties": {
-          "leagueId": {"type": "string", "minLength": 1},
-          "teamName": {"type": "string", "minLength": 1},
-          "channelId": {"type": "string", "minLength": 1},
-          "channelName": {"type": "string"}
-        },
-        "required": ["leagueId", "teamName", "channelId"],
-        "additionalProperties": false
-      },
-      "default": []
-    },
-    "liveRewindEnabled": {
-      "type": "boolean",
-      "default": false
-    },
-    "liveRewindCacheGB": {
-      "type": "number",
-      "minimum": 1,
-      "maximum": 500,
-      "default": 5
-    },
-    "liveRewindWindowMinutes": {
-      "type": "integer",
-      "enum": [15, 30, 60, 90, 120],
-      "default": 30
-    },
-    "liveRewindMinFreeGB": {
-      "type": "number",
-      "minimum": 1,
-      "maximum": 100,
-      "default": 2
-    },
-    "liveRewindMaxChannels": {
-      "type": "integer",
-      "minimum": 1,
-      "maximum": 100,
-      "default": 20
-    },
-    "virtualGroupSource": {
-      "type": "string",
-      "enum": ["group", "group_channel", "profile", "profile_group", "channel"],
-      "default": "group"
-    },
-    "collapseDuplicateVirtualGroups": {
-      "type": "boolean",
-      "default": true
-    },
-    "flattenRedundantGroupWrappers": {
-      "type": "boolean",
-      "default": true
-    },
-    "inferChannelNameGroups": {
-      "type": "boolean",
-      "default": false
-    },
-    "categoryRenames": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "sourcePath": {
-            "type": "string",
-            "minLength": 1
-          },
-          "displayName": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "required": ["sourcePath", "displayName"],
-        "additionalProperties": false
-      },
-      "default": []
-    },
-    "categoryAliases": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "sourcePath": {
-            "type": "string",
-            "minLength": 1
-          },
-          "aliasPath": {
-            "type": "string",
-            "minLength": 1
-          }
-        },
-        "required": ["sourcePath", "aliasPath"],
-        "additionalProperties": false
-      },
-      "default": []
-    },
-    "featuredEventIds": {
-      "type": "array",
-      "items": {
-        "type": "string",
-        "minLength": 1
-      },
-      "uniqueItems": true,
-      "maxItems": 100,
-      "default": []
-    },
-    "eventKeywords": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "properties": {
-          "categoryId": {
-            "type": "string",
-            "minLength": 1
-          },
-          "categoryName": {
-            "type": "string",
-            "minLength": 1
-          },
-          "keywords": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "minLength": 1
-            }
-          },
-          "excludeKeywords": {
-            "type": "array",
-            "items": {
-              "type": "string",
-              "minLength": 1
-            },
-            "default": []
-          },
-          "eventSeries": {
-            "type": "boolean",
-            "default": false
-          },
-          "groupWindowMinutes": {
-            "type": "integer",
-            "minimum": 15,
-            "maximum": 360,
-            "default": 60
-          }
-        },
-        "required": ["categoryId", "categoryName", "keywords"],
-        "additionalProperties": false
-      },
-      "default": []
-    }
-  },
-  "additionalProperties": false
-}`
-
 func GlobalConfigSchema() []*ConfigSchema {
 	return []*ConfigSchema{
-		objectSchema("connection", "Dispatcharr for Silo", "Legacy connection settings. New installations and source changes are managed in Dispatcharr Admin.", connectionJSONSchema, false, []*pluginv1.AdminFormField{
+		objectSchema("connection", "Dispatcharr for Silo", "Pick one source type. Silo shows every field in this form, so fill only the fields named by the selected source type.", connectionJSONSchema, true, []*pluginv1.AdminFormField{
 			{Key: "source_mode", Label: "Source Type", Description: "This controls which fields are required. Direct and Xtream both use Server URL, Username, and Password.", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_SELECT, DefaultValue: structpb.NewStringValue(string(SourceModeDirectLogin)), Options: []*pluginv1.AdminFormOption{
 				{Value: string(SourceModeDirectLogin), Label: "Dispatcharr Direct Connect", Description: "Use Dispatcharr REST. Fill Server URL, Username, and Password with your Dispatcharr dashboard login."},
 				{Value: string(SourceModeAPIKey), Label: "Dispatcharr Direct: API Key", Description: "Use Dispatcharr REST without saving a password. Fill Server URL and Admin API Key."},
 				{Value: string(SourceModeXtream), Label: "Xtream Codes", Description: "Use Dispatcharr's Xtream-compatible API. Fill Server URL, Username, and Password with the API & XC credentials from Dispatcharr user settings."},
 				{Value: string(SourceModeM3UXMLTV), Label: "M3U + XMLTV", Description: "Use playlist files only. Fill M3U Playlist URL and Custom XMLTV URL; ignore Server URL, Username, Password, and API Key."},
 			}},
-			{Key: "base_url", Label: "Server URL", Description: "Required for Direct Connect, API Key, and Xtream Codes. For Dispatcharr Xtream, use the Dispatcharr base URL, not the full player_api.php URL.", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT, Placeholder: "https://dispatcharr.example.com"},
+			{Key: "base_url", Label: "Server URL", Description: "Required for Direct Connect, API Key, and Xtream Codes. For Dispatcharr Xtream, use the Dispatcharr base URL, not the full player_api.php URL.", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT, Placeholder: "https://dispatcharr.example.com", Required: true},
 			{Key: "api_key", Label: "Admin API Key", Description: "Only used by Dispatcharr Direct: API Key. Find it in Dispatcharr under System > Users > Edit User > API & XC.", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_PASSWORD, Secret: true},
-			{Key: "channel_profile", Label: "Channel Profile", Description: "Optional for Dispatcharr Direct. Leave blank to parse all profiles, or enter one profile ID or exact name to scope the lineup.", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT, Placeholder: "attmonk | NY"},
 			{Key: "username", Label: "Username", Description: "Required for Direct Connect and Xtream Codes. Use your Dispatcharr dashboard username for Direct Connect, or the XC username from Dispatcharr user settings for Xtream.", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT},
 			{Key: "password", Label: "Password", Description: "Required for Direct Connect and Xtream Codes. Use your Dispatcharr dashboard password for Direct Connect, or the XC password from Dispatcharr user settings for Xtream.", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_PASSWORD, Secret: true},
 			{Key: "m3u_url", Label: "M3U Playlist URL", Description: "Only used by M3U + XMLTV. Leave this blank for Direct Connect, API Key, and Xtream Codes.", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT, Placeholder: "https://provider.example.com/playlist.m3u"},
 			{Key: "epg_xml_url", Label: "Custom XMLTV URL", Description: "Required for M3U + XMLTV. Optional for Xtream Codes if you want to override the provider's built-in EPG.", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_TEXT, Placeholder: "https://provider.example.com/guide.xml"},
+			{Key: "live_tv_enabled", Label: "Enable Live TV", Description: "Expose the Live TV app route to Silo users.", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_SWITCH, DefaultValue: structpb.NewBoolValue(true)},
+			{Key: "channel_refresh_hours", Label: "Channel Refresh Hours", Description: "Refresh cadence for channels and categories.", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_NUMBER, DefaultValue: structpb.NewNumberValue(DefaultChannelRefreshHours)},
+			{Key: "epg_refresh_hours", Label: "EPG Refresh Hours", Description: "Refresh cadence for guide data.", Control: pluginv1.AdminFormControl_ADMIN_FORM_CONTROL_NUMBER, DefaultValue: structpb.NewNumberValue(DefaultEPGRefreshHours)},
 		}, "Save Dispatcharr for Silo settings"),
-		objectSchema("category_settings", "Dispatcharr Admin Settings", "Admin-managed Live TV organization, recording, event, and ECM settings.", categorySettingsJSONSchema, false, []*pluginv1.AdminFormField{}, "Save admin settings"),
 	}
 }
 
 func UserConfigSchema() []*ConfigSchema {
 	return []*ConfigSchema{
-		objectSchema("preferences", "Preferences", "Per-user Dispatcharr plugin preferences stored by Silo.", `{"type":"object","properties":{"favorites":{"type":"object","additionalProperties":{"type":"boolean"}},"favoriteOrder":{"type":"array","items":{"type":"string"}},"autoFavorites":{"type":"object","additionalProperties":{"type":"boolean"}},"hiddenCategories":{"type":"object","additionalProperties":{"type":"boolean"}},"sportsFavoriteTeams":{"type":"object","additionalProperties":{"type":"boolean"}},"featuredEvents":{"type":"object","additionalProperties":{"type":"boolean"}},"keywordPasses":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"keyword":{"type":"string"},"createdAt":{"type":"integer"}},"required":["id","keyword"],"additionalProperties":false}},"recentSearches":{"type":"array","items":{"type":"string"}},"recentChannels":{"type":"array","items":{"type":"string"}},"continueWatching":{"type":"object","additionalProperties":true},"playback":{"type":"object","additionalProperties":true},"profiles":{"type":"object","additionalProperties":{"type":"object"}},"categoryParsing":{"type":"object","properties":{"enabled":{"type":"boolean"},"mode":{"type":"string","enum":["off","delimiter","regex"]},"delimiter":{"type":"string","enum":["dash","pipe"]},"regex":{"type":"string"},"output":{"type":"string"}},"additionalProperties":false},"profileSelection":{"type":"object","properties":{"mode":{"type":"string","enum":["all","selected"]},"profileIds":{"type":"array","items":{"type":"string"},"uniqueItems":true}},"required":["mode","profileIds"],"additionalProperties":false},"customGroups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string"},"name":{"type":"string"},"order":{"type":"integer"}},"required":["id","name"],"additionalProperties":false}},"customGroupMemberships":{"type":"object","additionalProperties":{"type":"array","items":{"type":"string"}}},"savedLineups":{"type":"array","items":{"type":"object","properties":{"id":{"type":"string","minLength":1},"name":{"type":"string","minLength":1},"categoryId":{"type":"string","minLength":1},"hideFinalGroups":{"type":"boolean","default":false}},"required":["id","name","categoryId"],"additionalProperties":false},"default":[]}},"additionalProperties":false}`, false, []*pluginv1.AdminFormField{}, "Save preferences"),
-		objectSchema("adminCategorySettings", "Admin Category Settings", "Admin-managed Live TV category mode saved through Silo plugin settings.", categorySettingsJSONSchema, false, []*pluginv1.AdminFormField{}, "Save category settings"),
+		objectSchema("preferences", "Preferences", "Per-user Dispatcharr plugin preferences stored by Silo.", `{"type":"object","properties":{"favorites":{"type":"object","additionalProperties":{"type":"boolean"}},"auto_favorites":{"type":"object","additionalProperties":{"type":"boolean"}},"hidden_categories":{"type":"object","additionalProperties":{"type":"boolean"}},"recent_channels":{"type":"array","items":{"type":"string"}},"continue_watching":{"type":"object","additionalProperties":true},"playback":{"type":"object","additionalProperties":true}},"additionalProperties":false}`, false, []*pluginv1.AdminFormField{}, "Save preferences"),
 	}
 }
 
 func objectSchema(key, title, description, jsonSchema string, required bool, fields []*pluginv1.AdminFormField, submitLabel string) *ConfigSchema {
-	if key == "preferences" {
-		jsonSchema = strings.Replace(jsonSchema, `"sportsFavoriteTeams":`, `"sportsMomentsEnabled":{"type":"boolean"},"sportsChannelDelays":{"type":"object","maxProperties":256,"additionalProperties":{"type":"integer","minimum":0,"maximum":300}},"sportsSwitchMode":{"type":"string","enum":["off","suggest","auto"]},"sportsFavoritePlayers":{"type":"object","maxProperties":200,"additionalProperties":{"type":"object","properties":{"name":{"type":"string","maxLength":120},"leagueId":{"type":"string","maxLength":80},"teamSlug":{"type":"string","maxLength":120},"teamName":{"type":"string","maxLength":120},"observedAtUnix":{"type":"number"}},"required":["name","leagueId"],"additionalProperties":false}},"sportsMultiviewLayout":{"type":"integer","enum":[2,4]},"sportsMultiviewPresets":{"type":"object","maxProperties":8,"additionalProperties":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":40},"layout":{"type":"integer","enum":[2,4]},"channelIds":{"type":"array","maxItems":4,"items":{"type":"string"}}},"required":["name","layout","channelIds"],"additionalProperties":false}},"sportsFavoriteTeams":`, 1)
-
-		jsonSchema = strings.Replace(jsonSchema, `"sportsFavoriteTeams":{"type":"object","additionalProperties":{"type":"boolean"}}`, `"sportsFavoriteTeams":{"type":"object","additionalProperties":{"type":"boolean"}},"sportsFavoriteTeamLabels":{"type":"object","additionalProperties":{"type":"object","properties":{"name":{"type":"string"},"abbreviation":{"type":"string"},"logoUrl":{"type":"string"},"leagueName":{"type":"string"}},"additionalProperties":false}},"sportsFavoriteLeagues":{"type":"object","additionalProperties":{"type":"boolean"}},"sportsPreferredChannels":{"type":"object","additionalProperties":{"type":"string"}},"sportsPreferredNetworks":{"type":"object","additionalProperties":{"type":"string"}},"sportsSpoilersHidden":{"type":"boolean"},"sportsPlayerSpoilersHidden":{"type":"boolean"},"sportsStatsDelaySeconds":{"type":"integer","minimum":0,"maximum":300}`, 1)
-	}
 	return &pluginv1.ConfigSchema{
 		Key:         key,
 		Title:       title,
