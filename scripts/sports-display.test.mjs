@@ -1,0 +1,173 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import vm from 'node:vm';
+
+test('team feeds lead broadcasters in the watch UI while explicit preferences win', () => {
+  const source = fs.readFileSync(new URL('../internal/plugin/ui/sports.js', import.meta.url), 'utf8');
+  let preferred = {}, networks = {};
+  const ctx = vm.createContext({
+    items: value => value || [], lower: value => String(value || '').toLowerCase(),
+    sportsTeamName: team => team?.name || '', channelMatchesProfileSelection: () => true,
+    sportsPreferredChannelMap: () => preferred, sportsPreferredNetworkMap: () => networks,
+    channelByID: () => null, currentProgram: () => ({}), nextProgram: () => ({}),
+    escapeHTML: value => String(value || ''), logoHTML: () => '', icon: () => ''
+  });
+  for (const name of ['uniqueEventChannels', 'sportsChannelFeedLabel', 'sportsBroadcastTraits', 'sportsBroadcastNetworkKey', 'rankedSportsBroadcasts', 'renderSportsBroadcastCard']) {
+    const start = source.indexOf('function ' + name + '(');
+    vm.runInContext(source.slice(start, source.indexOf('\nfunction ', start + 1)), ctx);
+  }
+  const event = {leagueId: 'nba', home: {name: 'New York Knicks'}, away: {name: 'Boston Celtics'}, channels: [
+    {id: 'espn', name: 'ESPN', reason: 'EPG match'},
+    {id: 'team', name: 'Boston Celtics', reason: 'Team channel', evidence: 'team'},
+    {id: 'admin', name: 'MSG', reason: 'Team channel', evidence: 'admin'}
+  ]};
+  let channels = ctx.rankedSportsBroadcasts(event);
+  assert.deepEqual([...channels.map(c => c.id)], ['admin', 'team', 'espn']);
+  assert.match(ctx.renderSportsBroadcastCard(channels[1], event, true), /<small>Team channel<\/small>/);
+  preferred = {nba: 'espn'};
+  assert.equal(ctx.rankedSportsBroadcasts(event)[0].id, 'espn');
+  preferred = {};
+  networks = {nba: 'espn'};
+  assert.equal(ctx.rankedSportsBroadcasts(event)[0].id, 'espn');
+});
+
+test('event details use browse breadcrumbs and sport art without generic league copy', () => {
+  const source = ['core', 'prefs', 'sports', 'admin', 'multiview', 'app'].map(name => fs.readFileSync(new URL('../internal/plugin/ui/' + name + '.js', import.meta.url), 'utf8')).join('\n');
+  const ctx = vm.createContext({
+    state: {sportsTab: 'live', sportsFailedMedia: {}}, isSportsPath: false,
+    escapeHTML: value => String(value || ''), safeSportsMediaURL: value => String(value || ''),
+    appRoutePart: encodeURIComponent, sportsTeamName: team => team?.name || '',
+    sportsEventTitle: event => event.name, icon: () => '', sportsScoresHidden: () => false,
+    rankedSportsBroadcasts: () => [], sportsReplayMatchesForEvent: () => [],
+    sportsEventArtwork: event => event.art || '', sportsArtworkDimensions: () => '',
+    sportsLeagueEvents: () => [], sportsEventHasPlayableAccess: () => true,
+    sportsEventIsLive: () => false, sportsFavoriteLeagueMap: () => ({}),
+    sportsBroadcastGroup: () => 'Other feeds', renderSportsBroadcastCard: channel => '<button data-channel="' + channel.id + '">Watch ' + channel.name + '</button>',
+    renderSportsDetailScore: () => '', renderSportsGameStats: () => '', sportsSectionHTML: () => ''
+  });
+  for (const name of ['appRouteHash', 'sportsTabLabel', 'sportsDetailLeagueLabel', 'renderSportsEventNavigation', 'sportsMediaFailed', 'sportsFieldBackgroundKind', 'sportsFieldBackgroundURL', 'markSportsDetailBackgroundFailed', 'renderSportsBroadcastGroups', 'renderSportsEventDetail']) {
+    const start = source.indexOf('function ' + name + '('), end = source.indexOf('\nfunction ', start + 1);
+    assert.ok(start >= 0 && end > start, name);
+    vm.runInContext(source.slice(start, end), ctx);
+  }
+  const hub = fs.readFileSync(new URL('../internal/plugin/ui/sports_hub.js', import.meta.url), 'utf8');
+  vm.runInContext(hub.slice(hub.indexOf('const SPORTS_HUB_TABS'), hub.indexOf('function sportsHubTabs(')), ctx);
+  const event = {leagueId: 'sports', leagueName: 'Sports', sportName: 'Sports', name: 'NWSL Soccer: Palmeiras vs Chicago Stars', away: {name: 'Palmeiras'}, home: {name: 'Chicago Stars'}};
+  const html = ctx.renderSportsEventDetail({}, event);
+  assert.match(html, /aria-label="Breadcrumb"/);
+  assert.match(html, /href="#\/sports\/live"/);
+  ctx.isSportsPath = true;
+  assert.equal(ctx.appRouteHash({view: 'sports', sportsTab: 'news'}), '#/news');
+  assert.equal(ctx.appRouteHash({view: 'sports', sportsTab: 'scores', sportsEvent: 'e1'}), '#/scores/event/e1');
+  ctx.isSportsPath = false;
+  assert.match(html, /aria-current="page"[^>]*>Palmeiras vs Chicago Stars/);
+  assert.doesNotMatch(html, />Previous<|>Next<|sports-eyebrow|data-sports-favorite-league/);
+  assert.match(html, /sports-event-hero-art.*images\.unsplash\.com/);
+  ctx.rankedSportsBroadcasts = () => [{id: 'watch-channel', name: 'Womens Sports Network'}];
+  const watchPage = ctx.renderSportsEventDetail({}, event);
+  assert.match(watchPage, /data-channel="watch-channel"/);
+  assert.match(watchPage.slice(0, watchPage.indexOf('</header>')), /sports-hero-feeds.*data-channel="watch-channel"/);
+  assert.equal((watchPage.match(/data-channel="watch-channel"/g) || []).length, 1);
+  assert.doesNotMatch(watchPage, /Matched channels|candidate|Other feeds/);
+  const nhl = {...event, leagueId: 'nhl', leagueName: 'NHL', sportName: 'Hockey'};
+  assert.match(ctx.renderSportsEventNavigation({}, nhl), /href="#\/sports\/live\/league\/nhl">NHL/);
+  const supplied = ctx.renderSportsEventDetail({}, {...event, art: 'https://example.com/event.jpg'});
+  assert.match(supplied, /src="https:\/\/example.com\/event.jpg"/);
+  assert.match(supplied, /data-sports-detail-fallback="https:\/\/images\.unsplash\.com/);
+  const attributes = new Map([['src', 'https://example.com/event.jpg'], ['data-sports-detail-fallback', 'https://example.com/pitch.jpg']]);
+  const classes = new Set(['has-art']);
+  const image = {hidden: false, getAttribute: key => attributes.get(key), setAttribute: (key, value) => attributes.set(key, value), removeAttribute: key => attributes.delete(key), parentElement: {classList: {remove: key => classes.delete(key), add: key => classes.add(key)}}};
+  ctx.markSportsDetailBackgroundFailed(image);
+  assert.equal(attributes.get('src'), 'https://example.com/pitch.jpg');
+  assert.equal(image.hidden, false);
+  ctx.markSportsDetailBackgroundFailed(image);
+  assert.equal(image.hidden, true);
+  assert.ok(classes.has('no-art'));
+  assert.ok(!classes.has('has-art'));
+});
+
+test('MLB details render innings, final stats, and honor hidden scores', () => {
+  const source = ['core', 'prefs', 'sports', 'admin', 'multiview', 'app'].map(name => fs.readFileSync(new URL('../internal/plugin/ui/' + name + '.js', import.meta.url), 'utf8')).join('\n');
+  const event = {id: 'mlb', leagueId: 'mlb', away: {name: 'Reds'}, home: {name: 'Dodgers'}};
+  const data = {available: true, completed: true, homeScore: '6', awayScore: '3', updatedAtUnix: 1, sourceUrl: 'https://www.espn.com/mlb/boxscore/', innings: [{number: 1, away: '0', home: '0'}, {number: 9, away: '0', home: ''}], rows: [{label: 'Hits', away: '7', home: '10'}]};
+  const ctx = vm.createContext({sportsGameStatsState: {id: 'mlb', data}, items: value => value || [], escapeHTML: value => String(value ?? ''), sportsScoresHidden: () => false, sportsEventStateID: e => e.id, sportsTeamName: t => t.name, sportsTeamAbbreviation: t => t.name.slice(0, 3).toUpperCase(), icon: () => '', sportsSectionHTML: (title, source, body) => title ? title + source + body : ''});
+  for (const name of ['safeHTTPS', 'externalLinkAttrs', 'sportsHasGameStats', 'renderSportsGameStats', 'renderSportsInnings', 'renderSportsBaseballSituation', 'renderSportsProbables', 'renderSportsLeaders', 'renderSportsPlays', 'renderSportsHighlights']) {
+    const start = source.indexOf('function ' + name + '('), end = source.indexOf('\nfunction ', start + 1);
+    vm.runInContext(source.slice(start, end), ctx);
+  }
+  const html = ctx.renderSportsGameStats(event);
+  assert.match(html, /^Final stats/);
+  assert.match(html, /aria-label="Inning scores"/);
+  assert.match(html, /<td>0<\/td><td>–<\/td>/);
+  assert.match(html, /Hits/);
+  data.completed = false; data.live = true;
+  data.situation = {balls: 3, strikes: 2, outs: 1, onFirst: true, onSecond: false, onThird: true, batter: {name: 'Elly De La Cruz', summary: '1-3'}};
+  data.plays = [{text: 'Stewart homered to right.', period: '8th Inning', scoring: true}];
+  data.videos = [{title: 'De La Cruz steals home', url: 'https://example.com/clip.mp4'}];
+  const live = ctx.renderSportsGameStats(event);
+  assert.match(live, /^Live stats/);
+  assert.match(live, /aria-label="Balls 3, strikes 2, 1 out, runners on first and third"/);
+  assert.match(live, /sports-base-first on/);
+  assert.match(live, /Elly De La Cruz/);
+  assert.match(live, /<li class="scoring">.*Stewart homered/);
+  assert.match(live, /Highlights.*href="https:\/\/example.com\/clip.mp4"/);
+  ctx.sportsScoresHidden = () => true;
+  assert.equal(ctx.renderSportsGameStats(event), '');
+  assert.equal(ctx.sportsHasGameStats({leagueId: 'nhl'}), true);
+  assert.equal(ctx.sportsHasGameStats({leagueId: 'cebl'}), false);
+});
+
+test('game-thumbs failures fall back once and retain the local layout', () => {
+  const source = ['core', 'prefs', 'sports', 'admin', 'multiview', 'app'].map(name => fs.readFileSync(new URL('../internal/plugin/ui/' + name + '.js', import.meta.url), 'utf8')).join('\n');
+  const state = {sportsFailedMedia: {}};
+  const ctx = vm.createContext({state, safeSportsMediaURL: value => String(value || ''), escapeHTML: value => String(value || '')});
+  for (const name of ['sportsMediaFailed', 'markSportsMediaFailed', 'sportsPreferredLogo', 'sportsGeneratedBackground', 'markSportsBackgroundFailed']) {
+    const start = source.indexOf('function ' + name + '(');
+    const end = source.indexOf('\nfunction ', start + 1);
+    vm.runInContext(source.slice(start, end), ctx);
+  }
+  const primary = 'https://game-thumbs.swvn.io/nba/lakers/logo.png?variant=dark';
+  const fallback = 'https://example.com/lakers.png';
+  assert.equal(ctx.sportsPreferredLogo(primary, fallback), primary);
+  let src = primary, removed = false;
+  const image = {hidden: false, getAttribute: () => src, setAttribute: (_, value) => { src = value; }, nextElementSibling: {hidden: true}, parentElement: {classList: {contains: () => true, remove: () => {removed = true;}}}};
+  ctx.markSportsMediaFailed(image);
+  assert.equal(src, fallback);
+  assert.equal(image.hidden, false);
+  assert.equal(ctx.sportsPreferredLogo(primary, fallback), fallback);
+  ctx.markSportsMediaFailed(image);
+  assert.equal(image.hidden, true);
+  assert.equal(image.nextElementSibling.hidden, false);
+  assert.equal(ctx.sportsPreferredLogo(primary, fallback), '');
+  assert.equal(removed, true);
+  src = 'https://game-thumbs.swvn.io/nba/lakers/celtics/thumb.png';
+  const event = {gameThumbsBackgroundUrl: src};
+  assert.match(ctx.sportsGeneratedBackground(event), /loading="lazy"/);
+  ctx.markSportsBackgroundFailed(image);
+  assert.equal(ctx.sportsGeneratedBackground(event), '');
+});
+
+test('upcoming promotions show a matchup heading and separate start time', () => {
+  const source = ['core', 'prefs', 'sports', 'admin', 'multiview', 'app'].map(name => fs.readFileSync(new URL('../internal/plugin/ui/' + name + '.js', import.meta.url), 'utf8')).join('\n');
+  const ctx = vm.createContext({
+    sportsTeamName: team => team?.name || 'Team', uniqueEventChannels: () => [],
+    sportsEventArtwork: () => '', sportsArtworkDimensions: () => '',
+    sportsEventIsLive: () => false, sportsEventIsOnNow: () => false,
+    renderSportsMatchupThumbnail: () => '', sportsDateLabel: () => 'Sun, Sep 6 4:10 PM',
+    escapeHTML: value => String(value), sportsEventStateID: () => 'test', icon: () => ''
+  });
+  for (const [start, end] of [
+    ['function sportsEventTitle(', 'function sportsEventStateID('],
+    ['function renderSportsFeature(', 'function renderStandaloneSportsReplayFeature(']
+  ]) vm.runInContext(source.slice(source.indexOf(start), source.indexOf(end)), ctx);
+  const event = {name: 'Next Game: New York Yankees @ San Diego Padres on 2026-09-06 at 04:10PM EDT', startUnix: 1788725400};
+  assert.equal(ctx.sportsEventTitle(event), 'New York Yankees @ San Diego Padres');
+  const html = ctx.renderSportsFeature(event);
+  assert.match(html, /<h1>New York Yankees @ San Diego Padres<\/h1>/);
+  assert.match(html, /sports-feature-schedule.*Sun, Sep 6 4:10 PM/);
+  assert.equal(ctx.sportsEventTitle({name: 'Classic MLB: 1986 Mets at Boston'}), 'Classic MLB: 1986 Mets at Boston');
+  assert.equal(ctx.sportsEventTitle({leagueId: 'lanka-premier-league', name: 'Cricket Highlights: LPL 2026: Gallants vs Kaps - Qualifier 2', away: {name: 'Galle Gallants'}, home: {name: 'Colombo Kaps'}, round: 'Qualifier 2'}), 'Galle Gallants vs Colombo Kaps · Qualifier 2');
+  assert.equal(ctx.sportsEventTitle({name: 'Next Game: Yankees @ Padres'}), 'Yankees @ Padres');
+  assert.doesNotMatch(ctx.renderSportsFeature({...event, startUnix: 0}), /sports-feature-schedule/);
+});

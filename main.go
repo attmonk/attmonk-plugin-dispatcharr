@@ -1,0 +1,274 @@
+package main
+
+import (
+	"context"
+	_ "embed"
+	"encoding/json"
+	"fmt"
+	"os"
+	goruntime "runtime"
+	"sync"
+	"time"
+
+	pluginv1 "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginproto/silo/plugin/v1"
+	publicmanifest "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/manifest"
+	sdkruntime "github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtime"
+	"github.com/Silo-Server/silo-plugin-sdk/pkg/pluginsdk/runtimedefault"
+	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/app"
+	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/cache"
+	"github.com/attmonk/attmonk-plugin-dispatcharr/internal/config"
+	pluginimpl "github.com/attmonk/attmonk-plugin-dispatcharr/internal/plugin"
+	"google.golang.org/protobuf/encoding/protojson"
+)
+
+//go:embed manifest.json
+var manifestJSON []byte
+
+// buildVersion is injected by CI via -ldflags:
+//
+//	-X main.buildVersion=<semver>
+var buildVersion string
+
+type runtimeServer struct {
+	runtimedefault.Server
+	pluginv1.UnimplementedConfigurationChecksServer
+	manifest *pluginv1.PluginManifest
+	settings *settingsState
+}
+
+func (s *runtimeServer) TestConfiguration(ctx context.Context, request *pluginv1.TestConfigurationRequest) (*pluginv1.TestConfigurationResponse, error) {
+	var draft config.Settings
+	for _, entry := range request.GetConfig() {
+		if entry.GetKey() == "connection" {
+			applyConnectionConfig(&draft, entry.GetValue().AsMap())
+		}
+	}
+	if err := draft.Validate(); err != nil {
+		return &pluginv1.TestConfigurationResponse{Message: err.Error()}, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := pluginimpl.CheckConnection(ctx, config.ConnectionFromSettings(draft)); err != nil {
+		message := "The source did not accept these settings. Check its address, credentials, and availability."
+		if ctx.Err() != nil {
+			message = "The connection check timed out or was cancelled. Check the source address and try again."
+		}
+		return &pluginv1.TestConfigurationResponse{Message: message}, nil
+	}
+	return &pluginv1.TestConfigurationResponse{Ok: true}, nil
+}
+
+type settingsState struct {
+	mu       sync.RWMutex
+	settings config.Settings
+}
+
+func (s *runtimeServer) GetManifest(context.Context, *pluginv1.GetManifestRequest) (*pluginv1.GetManifestResponse, error) {
+	return &pluginv1.GetManifestResponse{Manifest: s.manifest}, nil
+}
+
+func (s *runtimeServer) Configure(_ context.Context, request *pluginv1.ConfigureRequest) (*pluginv1.ConfigureResponse, error) {
+	if s.settings == nil {
+		return &pluginv1.ConfigureResponse{}, nil
+	}
+
+	current := s.settings.Get()
+	for _, entry := range request.GetConfig() {
+		values := entry.GetValue().AsMap()
+		switch entry.GetKey() {
+		case "connection":
+			applyConnectionConfig(&current, values)
+		case "general":
+			applyLegacyGeneralConfig(&current, values)
+		case "dispatcharr":
+			applyDispatcharrConfig(&current, values)
+		case "xtream":
+			applyXtreamConfig(&current, values)
+		case "m3u_xmltv":
+			applyM3UConfig(&current, values)
+		case "category_settings":
+			if encoded, err := json.Marshal(values); err == nil {
+				current.AdminSettings = encoded
+			}
+		}
+	}
+	if current.ChannelRefreshH == 0 {
+		current.ChannelRefreshH = config.DefaultChannelRefreshHours
+	}
+	if current.EPGRefreshH == 0 {
+		current.EPGRefreshH = config.DefaultEPGRefreshHours
+	}
+	s.settings.Set(current)
+	return &pluginv1.ConfigureResponse{}, nil
+}
+
+func applyConnectionConfig(settings *config.Settings, values map[string]any) {
+	applySourceMode(settings, values)
+	applyDispatcharrConfig(settings, values)
+	applyFirstPresentString(&settings.XtreamBaseURL, values, "xtream_base_url", "base_url")
+	applyFirstPresentString(&settings.XtreamUsername, values, "xtream_username", "username")
+	applyFirstPresentString(&settings.XtreamPassword, values, "xtream_password", "password")
+	applyM3UConfig(settings, values)
+	applyLegacyScheduleConfig(settings, values)
+	if settings.SourceMode == "" && settings.DispatcharrAPIKey != "" {
+		settings.SourceMode = config.SourceModeAPIKey
+	} else if settings.SourceMode == "" {
+		settings.SourceMode = config.SourceModeDirectLogin
+	}
+}
+
+func applyLegacyGeneralConfig(settings *config.Settings, values map[string]any) {
+	applySourceMode(settings, values)
+	applyLegacyScheduleConfig(settings, values)
+}
+
+func applySourceMode(settings *config.Settings, values map[string]any) {
+	if value, ok := values["source_mode"].(string); ok {
+		settings.SourceMode = config.SourceMode(value)
+	}
+}
+
+func applyDispatcharrConfig(settings *config.Settings, values map[string]any) {
+	applyStringIfPresent(&settings.DispatcharrURL, values, "base_url")
+	applyStringIfPresent(&settings.DispatcharrUser, values, "username")
+	applyStringIfPresent(&settings.DispatcharrPass, values, "password")
+	applyStringIfPresent(&settings.DispatcharrAPIKey, values, "api_key")
+	applyStringIfPresent(&settings.ChannelProfile, values, "channel_profile")
+}
+
+func applyXtreamConfig(settings *config.Settings, values map[string]any) {
+	applyStringIfPresent(&settings.XtreamBaseURL, values, "base_url")
+	applyStringIfPresent(&settings.XtreamUsername, values, "username")
+	applyStringIfPresent(&settings.XtreamPassword, values, "password")
+}
+
+func applyM3UConfig(settings *config.Settings, values map[string]any) {
+	applyStringIfPresent(&settings.M3UURL, values, "m3u_url")
+	applyStringIfPresent(&settings.EPGXMLURL, values, "epg_xml_url")
+}
+
+func applyStringIfPresent(target *string, values map[string]any, key string) {
+	value, exists := values[key]
+	if !exists {
+		return
+	}
+	*target = asString(value)
+}
+
+func applyFirstPresentString(target *string, values map[string]any, keys ...string) {
+	for _, key := range keys {
+		value, exists := values[key]
+		if !exists {
+			continue
+		}
+		if stringValue := asString(value); stringValue != "" {
+			*target = stringValue
+			return
+		}
+		*target = ""
+	}
+}
+
+func applyLegacyScheduleConfig(settings *config.Settings, values map[string]any) {
+	if value, ok := values["live_tv_enabled"].(bool); ok {
+		settings.LiveTVEnabled = value
+	}
+	if value, ok := values["channel_refresh_hours"].(float64); ok {
+		settings.ChannelRefreshH = int(value)
+	}
+	if value, ok := values["epg_refresh_hours"].(float64); ok {
+		settings.EPGRefreshH = int(value)
+	}
+}
+
+func (s *settingsState) Get() config.Settings {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.settings
+}
+
+func (s *settingsState) Set(settings config.Settings) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.settings = settings
+}
+
+func main() {
+	manifest, err := loadManifest()
+	if err != nil {
+		panic(err)
+	}
+	if len(os.Args) > 1 && os.Args[1] == "manifest" {
+		sdkruntime.Serve(sdkruntime.ServeConfig{Servers: sdkruntime.CapabilityServers{Runtime: &runtimeServer{manifest: manifest}}})
+		return
+	}
+	store := cache.NewStore()
+	defer store.Close()
+	snapshotStorage := cache.NewFileSnapshotStorage("")
+	defer snapshotStorage.Close()
+	if snapshot, ok, err := snapshotStorage.Load(); err != nil {
+		fmt.Fprintf(os.Stderr, "dispatcharr: load catalog snapshot: %v\n", err)
+	} else if ok {
+		store.Replace(snapshot)
+	}
+	settings := &settingsState{settings: config.Settings{SourceMode: config.SourceModeDirectLogin, LiveTVEnabled: true, ChannelRefreshH: config.DefaultChannelRefreshHours, EPGRefreshH: config.DefaultEPGRefreshHours}}
+	connectionStore := config.NewConnectionStore("")
+	settingsProvider := func() config.Settings {
+		current := settings.Get()
+		if connection, ok, loadErr := connectionStore.Load(); loadErr == nil && ok {
+			connection.Apply(&current)
+		}
+		return current
+	}
+	service := app.NewService(app.Dependencies{Store: store, SnapshotStorage: snapshotStorage})
+	if store.Current().Guide == nil && store.Current().ProgramCount() > 0 {
+		go func() {
+			if err := store.Persist(); err != nil {
+				fmt.Fprintf(os.Stderr, "guide cache migration failed: %v\n", err)
+			}
+		}()
+	}
+	coordinator := pluginimpl.NewRefreshCoordinator(service)
+
+	runtime := &runtimeServer{manifest: manifest, settings: settings}
+	encodedManifest, err := protojson.Marshal(manifest)
+	if err != nil {
+		panic(err)
+	}
+	sdkruntime.ServeManifestWithOptions(encodedManifest, buildVersion, sdkruntime.CapabilityServers{
+		ScheduledTask: pluginimpl.NewScheduledTaskServerWithCoordinator(coordinator, settingsProvider),
+		HttpRoutes:    pluginimpl.NewHTTPRoutesServerWithCoordinatorAndSettingsFiles(store, settingsProvider, coordinator, "", connectionStore),
+	}, sdkruntime.WithConfigurationChecks(runtime), sdkruntime.WithConfigure(func(ctx context.Context, entries []*pluginv1.ConfigEntry) error {
+		_, err := runtime.Configure(ctx, &pluginv1.ConfigureRequest{Config: entries})
+		return err
+	}))
+}
+
+const catalogSourceURL = "https://github.com/attmonk/attmonk-plugin-dispatcharr"
+
+func loadManifest() (*pluginv1.PluginManifest, error) {
+	manifest, err := publicmanifest.LoadWithChecksum(manifestJSON, buildVersion)
+	if err != nil {
+		return nil, err
+	}
+	if err := publicmanifest.ValidateCatalogPresentation(manifest, catalogSourceURL); err != nil {
+		return nil, err
+	}
+	if len(manifest.GetSupportedPlatforms()) == 0 {
+		manifest.SupportedPlatforms = []*pluginv1.SupportedPlatform{{
+			Os:   goruntime.GOOS,
+			Arch: goruntime.GOARCH,
+		}}
+	}
+	manifest.GlobalConfigSchema = config.GlobalConfigSchema()
+	manifest.UserConfigSchema = config.UserConfigSchema()
+
+	return manifest, nil
+}
+
+func asString(value any) string {
+	if stringValue, ok := value.(string); ok {
+		return stringValue
+	}
+	return ""
+}

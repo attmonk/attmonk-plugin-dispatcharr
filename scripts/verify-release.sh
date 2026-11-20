@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "${repo_root}"
+
+expected_version="${1:-}"
+mode="${2:-}"
+manifest_version="$(node -p "JSON.parse(require('fs').readFileSync('manifest.json', 'utf8')).version")"
+
+if [[ -n "${expected_version}" && "${manifest_version}" != "${expected_version}" ]]; then
+  printf 'manifest version %s does not match release version %s\n' "${manifest_version}" "${expected_version}" >&2
+  exit 1
+fi
+
+if [[ "${mode}" == "--version-only" ]]; then
+  exit 0
+fi
+
+node --check internal/plugin/ui/sports_moments.js
+node --test scripts/sports-moments.test.mjs
+node --test scripts/sports-following.test.mjs
+node --test scripts/sports-multiview.test.mjs
+node --check internal/plugin/ui/sports_assist.js
+node --test scripts/sports-assist.test.mjs
+node --check internal/plugin/ui/sports_companion.js
+node --test scripts/sports-companion.test.mjs
+go vet ./...
+go test ./...
+go test -race ./...
+node --check internal/plugin/ui/lineup.js
+node --check internal/plugin/ui/sports_replays.js
+node --check internal/plugin/ui/app.js
+node --check internal/plugin/ui/admin.js
+node --test scripts/sports-guide-admin.test.mjs
+node --check internal/plugin/ui/guide.js
+node --check internal/plugin/ui/player.js
+node --check internal/plugin/ui/sports_hub.js
+node --test scripts/sports-replays.test.mjs
+node --test scripts/player-sports.test.mjs
+node --test scripts/player-controls.test.mjs
+node --test scripts/mytv-favorites.test.mjs
+node --test scripts/sports-display.test.mjs
+node --test scripts/sports-artwork.test.mjs
+node --test scripts/guide-navigation.test.mjs
+node --test scripts/sports-hub.test.mjs
+node --test scripts/browse-layout.test.mjs
+node --test scripts/prefs-sync.test.mjs
+node --test scripts/prefs-profile.test.mjs
+go run . manifest >/dev/null
