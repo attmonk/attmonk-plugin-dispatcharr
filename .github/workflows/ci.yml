@@ -129,7 +129,7 @@ jobs:
         run: |
           set -euo pipefail
           cd release-dist
-          sha256sum * | sort -k2 > checksums.txt
+          sha256sum dispatcharr-* | sort -k2 > checksums.txt
 
       - name: Compute release metadata
         id: meta
